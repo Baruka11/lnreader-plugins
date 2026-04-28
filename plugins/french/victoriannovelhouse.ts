@@ -4,10 +4,6 @@ import { Plugin } from '@/types/plugin';
 import { NovelStatus } from '@libs/novelStatus';
 import { Filters, FilterTypes } from '@libs/filterInputs';
 
-// ─────────────────────────────────────────────────────────────
-// Types internes
-// ─────────────────────────────────────────────────────────────
-
 interface RawChapter {
   id: string;
   title: string;
@@ -21,24 +17,6 @@ interface RawVolume {
   volumeId: string;
   volumeDisplayName: string;
   chapters: RawChapter[];
-}
-
-interface RawOeuvre {
-  id: string;
-  title: string;
-  description: string;
-  image: string;
-  tags: string[];
-  genre: string;
-  auteur: string;
-  traducteur: string;
-  dateMaj: string;
-  addAt: string;
-  volumes: RawVolume[];
-  totalChapters: number;
-  stats: {
-    averageRating: number;
-  };
 }
 
 interface HomeNovelEntry {
@@ -59,45 +37,29 @@ interface HomeNovelEntry {
   genre: string;
   status: string;
   totalChapters: number;
-  lastChapterNb: number;
   auteur: string;
   tags: string[];
 }
-
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
 
 function extractNextFlightData(html: string): string {
   const parts: string[] = [];
   const re = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
-    try {
-      parts.push(JSON.parse('"' + m[1] + '"'));
-    } catch {
-      parts.push(m[1]);
-    }
+    try { parts.push(JSON.parse('"' + m[1] + '"')); }
+    catch { parts.push(m[1]); }
   }
   return parts.join('');
 }
 
-/**
- * Parse les romans depuis la page d'accueil (prop "novels":[...])
- */
 function parseNovelsFromRSC(raw: string): HomeNovelEntry[] {
   const marker = '"novels":[{';
   const idx = raw.indexOf(marker);
   if (idx === -1) return [];
-
   const arrStart = idx + '"novels":'.length;
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-  let end = arrStart;
-
-  for (; end < raw.length; end++) {
-    const ch = raw[end];
+  let depth = 0, inStr = false, escape = false;
+  for (let i = arrStart; i < raw.length; i++) {
+    const ch = raw[i];
     if (escape) { escape = false; continue; }
     if (ch === '\\') { escape = true; continue; }
     if (ch === '"') { inStr = !inStr; continue; }
@@ -105,298 +67,218 @@ function parseNovelsFromRSC(raw: string): HomeNovelEntry[] {
     if (ch === '[' || ch === '{') depth++;
     else if (ch === ']' || ch === '}') {
       depth--;
-      if (depth === 0) { end++; break; }
+      if (depth === 0) {
+        try { return JSON.parse(raw.slice(arrStart, i + 1)) as HomeNovelEntry[]; }
+        catch { return []; }
+      }
     }
   }
-
-  try {
-    return JSON.parse(raw.slice(arrStart, end)) as HomeNovelEntry[];
-  } catch {
-    return [];
-  }
+  return [];
 }
 
-/**
- * Parse le prop "oeuvre" depuis la page d'un roman /oeuvres/{id}
- * Les données sont dans: "oeuvre":{...}
- */
-function parseOeuvreFromRSC(raw: string): RawOeuvre | null {
-  // Chercher le marqueur "oeuvre":{ dans les données RSC
-  const marker = '"oeuvre":{';
+function parseVolumesFromRSC(raw: string): RawVolume[] {
+  const marker = '"volumes":[{"volumeId"';
   const idx = raw.indexOf(marker);
-  if (idx === -1) return null;
-
-  const objStart = idx + '"oeuvre":'.length;
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-  let end = objStart;
-
-  for (; end < raw.length; end++) {
-    const ch = raw[end];
+  if (idx === -1) return [];
+  const arrStart = raw.indexOf('[', idx + '"volumes":'.length);
+  if (arrStart === -1) return [];
+  let depth = 0, inStr = false, escape = false;
+  for (let i = arrStart; i < raw.length; i++) {
+    const ch = raw[i];
     if (escape) { escape = false; continue; }
     if (ch === '\\') { escape = true; continue; }
     if (ch === '"') { inStr = !inStr; continue; }
     if (inStr) continue;
-    if (ch === '{') depth++;
-    else if (ch === '}') {
+    if (ch === '[' || ch === '{') depth++;
+    else if (ch === ']' || ch === '}') {
       depth--;
-      if (depth === 0) { end++; break; }
+      if (depth === 0) {
+        try { return JSON.parse(raw.slice(arrStart, i + 1)) as RawVolume[]; }
+        catch { return []; }
+      }
     }
   }
-
-  try {
-    return JSON.parse(raw.slice(objStart, end)) as RawOeuvre;
-  } catch {
-    return null;
-  }
+  return [];
 }
 
-// ─────────────────────────────────────────────────────────────
-// Plugin
-// ─────────────────────────────────────────────────────────────
+function parseOeuvreMetaFromRSC(raw: string) {
+  const meta: { title?: string; image?: string; description?: string; auteur?: string; genre?: string } = {};
+  const titleM = raw.match(/"title"\s*:\s*"([^"]+)"/); if (titleM) meta.title = titleM[1];
+  const imgM = raw.match(/"image"\s*:\s*"(https:\/\/cdn\.world-novel\.fr\/images\/cover\/[^"]+)"/); if (imgM) meta.image = imgM[1];
+  const autM = raw.match(/"auteur"\s*:\s*"([^"]+)"/); if (autM) meta.auteur = autM[1];
+  const genM = raw.match(/"genre"\s*:\s*"([^"]+)"/); if (genM) meta.genre = genM[1];
+  const desM = raw.match(/"description"\s*:\s*"([\s\S]+?)(?<!\\)"/); if (desM) meta.description = desM[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+  return meta;
+}
 
 class VictorianNovelHousePlugin implements Plugin.PluginBase {
   id = 'victoriannovelhouse';
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '1.4.0';
+  version = '1.6.0-debug';
 
   private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
   private cdnBase = 'https://cdn.world-novel.fr/chapitres';
-
   private cachedNovels: HomeNovelEntry[] | null = null;
 
   private async getHomeNovels(): Promise<HomeNovelEntry[]> {
     if (this.cachedNovels) return this.cachedNovels;
-    const r = await fetchApi(this.site + '/');
-    const html = await r.text();
-    const raw = extractNextFlightData(html);
-    this.cachedNovels = parseNovelsFromRSC(raw);
+    try {
+      const r = await fetchApi(this.site + '/');
+      const html = await r.text();
+      const raw = extractNextFlightData(html);
+      this.cachedNovels = parseNovelsFromRSC(raw);
+    } catch { this.cachedNovels = []; }
     return this.cachedNovels;
   }
 
-  private mapStatus(status: string): string {
-    const s = (status || '').toLowerCase();
-    if (s.includes('cours')) return NovelStatus.Ongoing;
-    if (s.includes('termin')) return NovelStatus.Completed;
-    if (s.includes('pause') || s.includes('abandon')) return NovelStatus.OnHiatus;
-    return NovelStatus.Unknown;
-  }
-
-  async popularNovels(
-    pageNo: number,
-    { showLatestNovels }: Plugin.PopularNovelsOptions<typeof this.filters>,
-  ): Promise<Plugin.NovelItem[]> {
+  async popularNovels(pageNo: number, { showLatestNovels }: Plugin.PopularNovelsOptions<typeof this.filters>): Promise<Plugin.NovelItem[]> {
     if (pageNo > 1) return [];
-
     const entries = await this.getHomeNovels();
     if (!entries.length) return [];
-
     const sorted = showLatestNovels
       ? [...entries].sort((a, b) => b.dateMaj - a.dateMaj)
       : [...entries].sort((a, b) => b.rating - a.rating);
-
-    return sorted.map(e => ({
-      name: e.title,
-      path: `/oeuvres/${e.id}`,
-      cover: e.image,
-    }));
+    return sorted.map(e => ({ name: e.title, path: `/oeuvres/${e.id}`, cover: e.image }));
   }
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const novelId = novelPath.replace('/oeuvres/', '');
-
-    // Charger la page du roman pour avoir les volumes complets
-    const r = await fetchApi(this.site + novelPath);
-    const html = await r.text();
-    const raw = extractNextFlightData(html);
-
-    // Parser le prop "oeuvre" qui contient TOUS les volumes et chapitres
-    const oeuvre = parseOeuvreFromRSC(raw);
-
-    if (oeuvre && oeuvre.volumes && oeuvre.volumes.length > 0) {
-      // Aplatir tous les volumes en une liste de chapitres triés par ts (timestamp)
-      const allChapters: Plugin.ChapterItem[] = [];
-
-      for (const volume of oeuvre.volumes) {
-        for (const ch of volume.chapters) {
-          allChapters.push({
-            name: ch.title || ch.id,
-            path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
-            releaseTime: ch.date ? new Date(ch.ts || 0).toISOString() : undefined,
-            chapterNumber: undefined, // sera déduit de l'ordre
-          });
+    try {
+      const r = await fetchApi(this.site + novelPath);
+      const html = await r.text();
+      const raw = extractNextFlightData(html);
+      const meta = parseOeuvreMetaFromRSC(raw);
+      const volumes = parseVolumesFromRSC(raw);
+      if (volumes.length > 0) {
+        const orderedVolumes = [...volumes].reverse();
+        const chapters: Plugin.ChapterItem[] = [];
+        let n = 1;
+        for (const vol of orderedVolumes) {
+          const sorted = [...vol.chapters].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+          for (const ch of sorted) {
+            chapters.push({
+              name: ch.title || ch.id,
+              path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
+              releaseTime: ch.ts ? new Date(ch.ts).toISOString() : undefined,
+              chapterNumber: n++,
+            });
+          }
         }
+        return { path: novelPath, name: meta.title || novelId, cover: meta.image, summary: meta.description, author: meta.auteur, genres: meta.genre, status: NovelStatus.Unknown, chapters };
       }
-
-      // Trier par timestamp croissant (du plus ancien au plus récent)
-      allChapters.sort((a, b) => {
-        // Récupérer les ts depuis les volumes
-        return 0; // déjà dans le bon ordre depuis les données
-      });
-
-      // Extraire les chapitres de tous les volumes dans l'ordre (vol 0 → vol 1 → ...)
-      // Les volumes sont déjà dans l'ordre dans le JSON, on les inverse car
-      // ils sont affichés en ordre décroissant sur le site (volume le plus récent en premier)
-      const orderedChapters: Plugin.ChapterItem[] = [];
-      const reversedVolumes = [...oeuvre.volumes].reverse(); // Volume 0 d'abord
-
-      let chapterNumber = 1;
-      for (const volume of reversedVolumes) {
-        // Trier les chapitres du volume par ts croissant
-        const sortedChaps = [...volume.chapters].sort((a, b) => (a.ts || 0) - (b.ts || 0));
-        for (const ch of sortedChaps) {
-          orderedChapters.push({
-            name: ch.title || ch.id,
-            path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
-            releaseTime: ch.ts ? new Date(ch.ts).toISOString() : undefined,
-            chapterNumber: chapterNumber++,
-          });
-        }
-      }
-
-      return {
-        path: novelPath,
-        name: oeuvre.title,
-        cover: oeuvre.image,
-        summary: oeuvre.description,
-        author: oeuvre.auteur,
-        genres: oeuvre.genre,
-        status: NovelStatus.Unknown,
-        chapters: orderedChapters,
-      };
-    }
-
-    // Fallback : utiliser les données de la page d'accueil
+    } catch {}
     const allNovels = await this.getHomeNovels();
     const entry = allNovels.find(n => n.id === novelId);
-
-    if (!entry) {
-      return { path: novelPath, name: novelId, chapters: [] };
-    }
-
-    const chapters = [...entry.chapters]
-      .sort((a, b) => a.chapterNumber - b.chapterNumber)
-      .map((c, i) => ({
-        name: c.title || c.id,
-        path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
-        releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
-        chapterNumber: c.chapterNumber || i + 1,
-      }));
-
-    return {
-      path: novelPath,
-      name: entry.title,
-      cover: entry.image,
-      summary: entry.desc,
-      author: entry.auteur,
-      genres: entry.genre,
-      status: this.mapStatus(entry.status),
-      chapters,
-    };
+    if (!entry) return { path: novelPath, name: novelId, chapters: [] };
+    const chapters = [...entry.chapters].sort((a, b) => a.chapterNumber - b.chapterNumber).map((c, i) => ({
+      name: c.title || c.id,
+      path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
+      releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
+      chapterNumber: c.chapterNumber || i + 1,
+    }));
+    return { path: novelPath, name: entry.title, cover: entry.image, summary: entry.desc, author: entry.auteur, genres: entry.genre, status: NovelStatus.Unknown, chapters };
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    // Format : /lecture/{novelId}/volumes/{volumeId}/chapitres/{chapterId}
-    const match = chapterPath.match(
-      /\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/
-    );
+    const debugLines: string[] = [`<h3>DEBUG parseChapter</h3>`, `<p>chapterPath = <code>${chapterPath}</code></p>`];
 
-    if (match) {
+    const match = chapterPath.match(/\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/);
+
+    if (!match) {
+      debugLines.push(`<p>❌ Regex non matchée</p>`);
+    } else {
       const [, novelId, volumeId, chapterId] = match;
+      debugLines.push(`<p>novelId = ${novelId}<br>volumeId = ${volumeId}<br>chapterId = ${chapterId}</p>`);
+
+      // Test CDN
       const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${this.userId}`;
+      debugLines.push(`<p>CDN URL = <code>${cdnUrl}</code></p>`);
 
       try {
         const r = await fetchApi(cdnUrl);
-        if (r.ok) {
-          const text = await r.text();
+        debugLines.push(`<p>CDN status = ${r.status}</p>`);
+        const text = await r.text();
+        debugLines.push(`<p>CDN réponse (200 premiers chars) = <code>${text.slice(0, 200).replace(/</g, '&lt;')}</code></p>`);
 
-          // Réponse JSON
+        if (r.ok && text.length > 100) {
+          // Tenter JSON
           try {
             const json = JSON.parse(text);
-            const content = json.content ?? json.text ?? json.body ?? json.html ?? '';
-            if (typeof content === 'string' && content.length > 100) {
+            const keys = Object.keys(json).join(', ');
+            debugLines.push(`<p>JSON keys = ${keys}</p>`);
+            const content = json.content ?? json.text ?? json.body ?? json.html ?? json.data ?? '';
+            if (typeof content === 'string' && content.length > 50) {
               return content.replace(/\\n/g, '\n').replace(/\\"/g, '"');
             }
-          } catch {}
+            // Chercher récursivement une longue chaîne
+            for (const [k, v] of Object.entries(json)) {
+              if (typeof v === 'string' && v.length > 100) {
+                debugLines.push(`<p>Contenu trouvé dans clé "${k}"</p>`);
+                return (v as string).replace(/\\n/g, '\n').replace(/\\"/g, '"');
+              }
+            }
+          } catch {
+            debugLines.push(`<p>Pas du JSON</p>`);
+          }
 
-          // Réponse HTML
-          if (text.trimStart().startsWith('<') && text.length > 100) {
+          if (text.trimStart().startsWith('<')) {
+            debugLines.push(`<p>Réponse HTML directe</p>`);
             return text;
           }
 
-          // Texte brut
           if (text.length > 100) {
-            return text
-              .split('\n')
-              .filter(l => l.trim())
-              .map(l => `<p>${l.trim()}</p>`)
-              .join('\n');
+            return text.split('\n').filter(l => l.trim()).map(l => `<p>${l.trim()}</p>`).join('\n');
           }
         }
-      } catch {}
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        debugLines.push(`<p>❌ Erreur CDN : ${msg}</p>`);
+      }
+
+      // Test page web
+      const webUrl = this.site + chapterPath;
+      debugLines.push(`<p>Fallback page web : <code>${webUrl}</code></p>`);
+      try {
+        const r2 = await fetchApi(webUrl);
+        debugLines.push(`<p>Web status = ${r2.status}</p>`);
+        const html = await r2.text();
+        debugLines.push(`<p>HTML length = ${html.length}</p>`);
+        const $ = load(html);
+        for (const sel of ['.chapter-content', '[class*="chapterContent"]', '[class*="chapter-text"]', '.prose', 'article', 'main']) {
+          const el = $(sel);
+          if (el.length && el.text().trim().length > 200) {
+            debugLines.push(`<p>✅ Contenu trouvé via sélecteur CSS "${sel}"</p>`);
+            return `${debugLines.join('\n')}\n<hr>${el.html() || ''}`;
+          }
+        }
+        debugLines.push(`<p>Aucun sélecteur CSS n'a trouvé de contenu</p>`);
+        const raw = extractNextFlightData(html);
+        debugLines.push(`<p>RSC length = ${raw.length}</p>`);
+        const contentM = raw.match(/"(?:content|text|body|html)"\s*:\s*"([\s\S]{200,}?)(?<!\\)"/);
+        if (contentM) {
+          debugLines.push(`<p>✅ Contenu trouvé dans RSC</p>`);
+          return contentM[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+        }
+        debugLines.push(`<p>Extrait RSC (500 chars) = <code>${raw.slice(0, 500).replace(/</g, '&lt;')}</code></p>`);
+      } catch (e2: unknown) {
+        const msg = e2 instanceof Error ? e2.message : String(e2);
+        debugLines.push(`<p>❌ Erreur web : ${msg}</p>`);
+      }
     }
 
-    // Fallback : parser la page web
-    try {
-      const r = await fetchApi(this.site + chapterPath);
-      const html = await r.text();
-      const $ = load(html);
-
-      const selectors = [
-        '.chapter-content',
-        '[class*="chapterContent"]',
-        '[class*="chapter-text"]',
-        '.prose',
-        'article',
-      ];
-
-      for (const sel of selectors) {
-        const el = $(sel);
-        if (el.length && el.text().trim().length > 200) {
-          return el.html() || '';
-        }
-      }
-
-      const raw = extractNextFlightData(html);
-      const m = raw.match(/"(?:content|text|body)":"([\s\S]{200,}?)(?<!\\)"/);
-      if (m) {
-        return m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-      }
-    } catch {}
-
-    return "<p><em>Le contenu de ce chapitre est chargé dynamiquement. Veuillez l'ouvrir dans le navigateur intégré.</em></p>";
+    return debugLines.join('\n');
   }
 
-  async searchNovels(
-    searchTerm: string,
-    pageNo: number,
-  ): Promise<Plugin.NovelItem[]> {
+  async searchNovels(searchTerm: string, pageNo: number): Promise<Plugin.NovelItem[]> {
     if (pageNo > 1) return [];
-
     const entries = await this.getHomeNovels();
-    const q = searchTerm
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
-
-    return entries
-      .filter(e => {
-        const title = e.title
-          .toLowerCase()
-          .normalize('NFD')
-          .replace(/[\u0300-\u036f]/g, '');
-        const author = (e.auteur || '').toLowerCase();
-        const tags = e.tags.join(' ').toLowerCase();
-        return title.includes(q) || author.includes(q) || tags.includes(q);
-      })
-      .map(e => ({
-        name: e.title,
-        path: `/oeuvres/${e.id}`,
-        cover: e.image,
-      }));
+    const q = searchTerm.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    return entries.filter(e => {
+      const title = e.title.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      return title.includes(q) || (e.auteur || '').toLowerCase().includes(q);
+    }).map(e => ({ name: e.title, path: `/oeuvres/${e.id}`, cover: e.image }));
   }
 
   filters = {
@@ -404,17 +286,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
       type: FilterTypes.Picker,
       label: 'Genre',
       value: '',
-      options: [
-        { label: 'Tous', value: '' },
-        { label: 'Action', value: 'Action' },
-        { label: 'Aventure', value: 'Aventure' },
-        { label: 'Fantaisie', value: 'Fantais' },
-        { label: 'Mystère', value: 'Mystère' },
-        { label: 'Romance', value: 'Romance' },
-        { label: 'Système / LitRPG', value: 'Système' },
-        { label: 'Science-fiction', value: 'Science' },
-        { label: 'Surnaturel', value: 'Surnaturel' },
-      ],
+      options: [{ label: 'Tous', value: '' }],
     },
   } satisfies Filters;
 }
