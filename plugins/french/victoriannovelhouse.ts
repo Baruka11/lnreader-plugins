@@ -5,7 +5,67 @@ import { NovelStatus } from '@libs/novelStatus';
 import { Filters, FilterTypes } from '@libs/filterInputs';
 
 // ─────────────────────────────────────────────────────────────
-// Helpers – extraction des données Next.js SSR
+// Types internes
+// ─────────────────────────────────────────────────────────────
+
+interface RawChapter {
+  id: string;
+  title: string;
+  date: string;
+  volumeId: string;
+  volumeDisplayName: string;
+  ts: number;
+}
+
+interface RawVolume {
+  volumeId: string;
+  volumeDisplayName: string;
+  chapters: RawChapter[];
+}
+
+interface RawOeuvre {
+  id: string;
+  title: string;
+  description: string;
+  image: string;
+  tags: string[];
+  genre: string;
+  auteur: string;
+  traducteur: string;
+  dateMaj: string;
+  addAt: string;
+  volumes: RawVolume[];
+  totalChapters: number;
+  stats: {
+    averageRating: number;
+  };
+}
+
+interface HomeNovelEntry {
+  id: string;
+  title: string;
+  image: string;
+  rating: number;
+  desc: string;
+  chapters: Array<{
+    id: string;
+    title: string;
+    date: number;
+    volumeId: string;
+    volumeDisplayName: string;
+    chapterNumber: number;
+  }>;
+  dateMaj: number;
+  genre: string;
+  status: string;
+  totalChapters: number;
+  lastChapterNb: number;
+  auteur: string;
+  tags: string[];
+}
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
 // ─────────────────────────────────────────────────────────────
 
 function extractNextFlightData(html: string): string {
@@ -22,7 +82,10 @@ function extractNextFlightData(html: string): string {
   return parts.join('');
 }
 
-function parseNovelsFromRSC(raw: string): NovelEntry[] {
+/**
+ * Parse les romans depuis la page d'accueil (prop "novels":[...])
+ */
+function parseNovelsFromRSC(raw: string): HomeNovelEntry[] {
   const marker = '"novels":[{';
   const idx = raw.indexOf(marker);
   if (idx === -1) return [];
@@ -47,109 +110,46 @@ function parseNovelsFromRSC(raw: string): NovelEntry[] {
   }
 
   try {
-    return JSON.parse(raw.slice(arrStart, end)) as NovelEntry[];
+    return JSON.parse(raw.slice(arrStart, end)) as HomeNovelEntry[];
   } catch {
     return [];
   }
 }
 
 /**
- * Extrait tous les chapitres depuis le RSC, indépendamment de l'ordre des clés JSON.
+ * Parse le prop "oeuvre" depuis la page d'un roman /oeuvres/{id}
+ * Les données sont dans: "oeuvre":{...}
  */
-function parseChaptersFromRSC(raw: string): ChapterEntry[] {
-  const results: ChapterEntry[] = [];
-  const seen = new Set<string>();
+function parseOeuvreFromRSC(raw: string): RawOeuvre | null {
+  // Chercher le marqueur "oeuvre":{ dans les données RSC
+  const marker = '"oeuvre":{';
+  const idx = raw.indexOf(marker);
+  if (idx === -1) return null;
 
-  // Stratégie 1 : parser les blocs JSON complets contenant "chapterNumber"
-  const chapterBlockRe = /\{[^{}]*"chapterNumber"\s*:\s*\d+[^{}]*\}/g;
-  let m: RegExpExecArray | null;
+  const objStart = idx + '"oeuvre":'.length;
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  let end = objStart;
 
-  while ((m = chapterBlockRe.exec(raw)) !== null) {
-    try {
-      const obj = JSON.parse(m[0]);
-      const id = obj.id;
-      const volumeId = obj.volumeId;
-      const chapterNumber = obj.chapterNumber;
-
-      if (!id || !volumeId || typeof chapterNumber !== 'number') continue;
-      if (seen.has(id)) continue;
-      seen.add(id);
-
-      results.push({
-        id,
-        title: obj.title || id,
-        date: obj.date || 0,
-        volumeId,
-        volumeDisplayName: obj.volumeDisplayName || '',
-        chapterNumber,
-      });
-    } catch {}
-  }
-
-  // Stratégie 2 (fallback) : extraction par regex champ par champ
-  if (results.length === 0) {
-    const chunkSize = 600;
-    const idRe = /"id"\s*:\s*"([^"]+)"/g;
-    let idMatch: RegExpExecArray | null;
-
-    while ((idMatch = idRe.exec(raw)) !== null) {
-      const start = Math.max(0, idMatch.index - 100);
-      const end = Math.min(raw.length, idMatch.index + chunkSize);
-      const chunk = raw.slice(start, end);
-
-      const chapterNumMatch = chunk.match(/"chapterNumber"\s*:\s*(\d+)/);
-      const volumeIdMatch = chunk.match(/"volumeId"\s*:\s*"([^"]+)"/);
-      if (!chapterNumMatch || !volumeIdMatch) continue;
-
-      const id = idMatch[1];
-      if (seen.has(id)) continue;
-      seen.add(id);
-
-      const titleMatch = chunk.match(/"title"\s*:\s*"([^"]+)"/);
-      const dateMatch = chunk.match(/"date"\s*:\s*(\d+)/);
-      const volumeDisplayMatch = chunk.match(/"volumeDisplayName"\s*:\s*"([^"]+)"/);
-
-      results.push({
-        id,
-        title: titleMatch ? titleMatch[1] : id,
-        date: dateMatch ? parseInt(dateMatch[1]) : 0,
-        volumeId: volumeIdMatch[1],
-        volumeDisplayName: volumeDisplayMatch ? volumeDisplayMatch[1] : '',
-        chapterNumber: parseInt(chapterNumMatch[1]),
-      });
+  for (; end < raw.length; end++) {
+    const ch = raw[end];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) { end++; break; }
     }
   }
 
-  return results.sort((a, b) => a.chapterNumber - b.chapterNumber);
-}
-
-// ─────────────────────────────────────────────────────────────
-// Types internes
-// ─────────────────────────────────────────────────────────────
-
-interface ChapterEntry {
-  id: string;
-  title: string;
-  date: number;
-  volumeId: string;
-  volumeDisplayName: string;
-  chapterNumber: number;
-}
-
-interface NovelEntry {
-  id: string;
-  title: string;
-  image: string;
-  rating: number;
-  desc: string;
-  chapters: ChapterEntry[];
-  dateMaj: number;
-  genre: string;
-  status: string;
-  totalChapters: number;
-  lastChapterNb: number;
-  auteur: string;
-  tags: string[];
+  try {
+    return JSON.parse(raw.slice(objStart, end)) as RawOeuvre;
+  } catch {
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -161,29 +161,20 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '1.2.0';
+  version = '1.4.0';
 
   private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
   private cdnBase = 'https://cdn.world-novel.fr/chapitres';
 
-  private cachedNovels: NovelEntry[] | null = null;
+  private cachedNovels: HomeNovelEntry[] | null = null;
 
-  private async getHomeNovels(): Promise<NovelEntry[]> {
+  private async getHomeNovels(): Promise<HomeNovelEntry[]> {
     if (this.cachedNovels) return this.cachedNovels;
     const r = await fetchApi(this.site + '/');
     const html = await r.text();
     const raw = extractNextFlightData(html);
     this.cachedNovels = parseNovelsFromRSC(raw);
     return this.cachedNovels;
-  }
-
-  private chapterToItem(c: ChapterEntry, novelId: string): Plugin.ChapterItem {
-    return {
-      name: c.title || c.id,
-      path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
-      releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
-      chapterNumber: c.chapterNumber,
-    };
   }
 
   private mapStatus(status: string): string {
@@ -217,32 +208,83 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const novelId = novelPath.replace('/oeuvres/', '');
 
-    const allNovels = await this.getHomeNovels();
-    const entry = allNovels.find(n => n.id === novelId) || null;
+    // Charger la page du roman pour avoir les volumes complets
+    const r = await fetchApi(this.site + novelPath);
+    const html = await r.text();
+    const raw = extractNextFlightData(html);
 
-    let chapters: Plugin.ChapterItem[] = [];
+    // Parser le prop "oeuvre" qui contient TOUS les volumes et chapitres
+    const oeuvre = parseOeuvreFromRSC(raw);
 
-    try {
-      const r = await fetchApi(this.site + novelPath);
-      const html = await r.text();
-      const raw = extractNextFlightData(html);
-      const parsed = parseChaptersFromRSC(raw);
+    if (oeuvre && oeuvre.volumes && oeuvre.volumes.length > 0) {
+      // Aplatir tous les volumes en une liste de chapitres triés par ts (timestamp)
+      const allChapters: Plugin.ChapterItem[] = [];
 
-      if (parsed.length > 0) {
-        chapters = parsed.map(c => this.chapterToItem(c, novelId));
+      for (const volume of oeuvre.volumes) {
+        for (const ch of volume.chapters) {
+          allChapters.push({
+            name: ch.title || ch.id,
+            path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
+            releaseTime: ch.date ? new Date(ch.ts || 0).toISOString() : undefined,
+            chapterNumber: undefined, // sera déduit de l'ordre
+          });
+        }
       }
-    } catch {}
 
-    // Fallback : chapitres depuis la page d'accueil
-    if (!chapters.length && entry?.chapters?.length) {
-      chapters = [...entry.chapters]
-        .sort((a, b) => a.chapterNumber - b.chapterNumber)
-        .map(c => this.chapterToItem(c, novelId));
+      // Trier par timestamp croissant (du plus ancien au plus récent)
+      allChapters.sort((a, b) => {
+        // Récupérer les ts depuis les volumes
+        return 0; // déjà dans le bon ordre depuis les données
+      });
+
+      // Extraire les chapitres de tous les volumes dans l'ordre (vol 0 → vol 1 → ...)
+      // Les volumes sont déjà dans l'ordre dans le JSON, on les inverse car
+      // ils sont affichés en ordre décroissant sur le site (volume le plus récent en premier)
+      const orderedChapters: Plugin.ChapterItem[] = [];
+      const reversedVolumes = [...oeuvre.volumes].reverse(); // Volume 0 d'abord
+
+      let chapterNumber = 1;
+      for (const volume of reversedVolumes) {
+        // Trier les chapitres du volume par ts croissant
+        const sortedChaps = [...volume.chapters].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+        for (const ch of sortedChaps) {
+          orderedChapters.push({
+            name: ch.title || ch.id,
+            path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
+            releaseTime: ch.ts ? new Date(ch.ts).toISOString() : undefined,
+            chapterNumber: chapterNumber++,
+          });
+        }
+      }
+
+      return {
+        path: novelPath,
+        name: oeuvre.title,
+        cover: oeuvre.image,
+        summary: oeuvre.description,
+        author: oeuvre.auteur,
+        genres: oeuvre.genre,
+        status: NovelStatus.Unknown,
+        chapters: orderedChapters,
+      };
     }
+
+    // Fallback : utiliser les données de la page d'accueil
+    const allNovels = await this.getHomeNovels();
+    const entry = allNovels.find(n => n.id === novelId);
 
     if (!entry) {
-      return { path: novelPath, name: novelId, chapters };
+      return { path: novelPath, name: novelId, chapters: [] };
     }
+
+    const chapters = [...entry.chapters]
+      .sort((a, b) => a.chapterNumber - b.chapterNumber)
+      .map((c, i) => ({
+        name: c.title || c.id,
+        path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
+        releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
+        chapterNumber: c.chapterNumber || i + 1,
+      }));
 
     return {
       path: novelPath,
@@ -268,29 +310,31 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
 
       try {
         const r = await fetchApi(cdnUrl);
-        const text = await r.text();
+        if (r.ok) {
+          const text = await r.text();
 
-        // Réponse JSON
-        try {
-          const json = JSON.parse(text);
-          const content = json.content ?? json.text ?? json.body ?? json.html ?? '';
-          if (typeof content === 'string' && content.length > 100) {
-            return content.replace(/\\n/g, '\n').replace(/\\"/g, '"');
+          // Réponse JSON
+          try {
+            const json = JSON.parse(text);
+            const content = json.content ?? json.text ?? json.body ?? json.html ?? '';
+            if (typeof content === 'string' && content.length > 100) {
+              return content.replace(/\\n/g, '\n').replace(/\\"/g, '"');
+            }
+          } catch {}
+
+          // Réponse HTML
+          if (text.trimStart().startsWith('<') && text.length > 100) {
+            return text;
           }
-        } catch {}
 
-        // Réponse HTML brut
-        if (text.trimStart().startsWith('<') && text.length > 100) {
-          return text;
-        }
-
-        // Texte brut → paragraphes
-        if (text.length > 100) {
-          return text
-            .split('\n')
-            .filter(l => l.trim())
-            .map(l => `<p>${l.trim()}</p>`)
-            .join('\n');
+          // Texte brut
+          if (text.length > 100) {
+            return text
+              .split('\n')
+              .filter(l => l.trim())
+              .map(l => `<p>${l.trim()}</p>`)
+              .join('\n');
+          }
         }
       } catch {}
     }
