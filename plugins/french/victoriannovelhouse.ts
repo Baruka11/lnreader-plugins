@@ -115,7 +115,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '2.1.0';
+  version = '2.2.0';
 
   private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
   private cdnBase = 'https://cdn.world-novel.fr/chapitres';
@@ -152,12 +152,10 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
         let n = 1;
         for (const vol of [...volumes].reverse()) {
           for (const ch of [...vol.chapters].sort((a, b) => (a.ts || 0) - (b.ts || 0))) {
-            // ⚠️ On utilise volumeDisplayName (pas volumeId) car le CDN attend le nom affiché
-            // On stocke: novelId/volumeDisplayName/chapterId séparés par §
-            // pour pouvoir les récupérer proprement dans parseChapter
+            // On utilise volumeId (ID interne) car c'est ce que le CDN attend réellement
             chapters.push({
               name: ch.title || ch.id,
-              path: `/cdnchapter/${encodeURIComponent(novelId)}§${encodeURIComponent(ch.volumeDisplayName)}§${encodeURIComponent(ch.id)}`,
+              path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
               releaseTime: ch.ts ? new Date(ch.ts).toISOString() : undefined,
               chapterNumber: n++,
             });
@@ -176,7 +174,6 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
       }
     } catch {}
 
-    // Fallback accueil
     const entry = (await this.getHomeNovels()).find(n => n.id === novelId);
     if (!entry) return { path: novelPath, name: novelId, chapters: [] };
     return {
@@ -184,7 +181,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
       author: entry.auteur, genres: entry.genre, status: NovelStatus.Unknown,
       chapters: [...entry.chapters].sort((a, b) => a.chapterNumber - b.chapterNumber).map((c, i) => ({
         name: c.title || c.id,
-        path: `/cdnchapter/${encodeURIComponent(novelId)}§${encodeURIComponent(c.volumeDisplayName)}§${encodeURIComponent(c.id)}`,
+        path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
         releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
         chapterNumber: c.chapterNumber || i + 1,
       })),
@@ -192,30 +189,27 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    // Format: /cdnchapter/novelId§volumeDisplayName§chapterId
-    const cdnMatch = chapterPath.match(/^\/cdnchapter\/([^§]+)§([^§]+)§(.+)$/);
-    if (!cdnMatch) return `<p>Chemin invalide : ${chapterPath}</p>`;
+    const match = chapterPath.match(/\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/);
+    if (!match) return `<p>Chemin invalide : ${chapterPath}</p>`;
 
-    const novelId = decodeURIComponent(cdnMatch[1]);
-    const volumeDisplayName = decodeURIComponent(cdnMatch[2]);
-    const chapterId = decodeURIComponent(cdnMatch[3]);
+    const [, novelId, volumeId, chapterId] = match;
 
-    // Le CDN attend : path=novelId/volumeDisplayName/chapterId
-    const cdnUrl = `${this.cdnBase}/?path=${encodeURIComponent(novelId)}/${encodeURIComponent(volumeDisplayName)}/${encodeURIComponent(chapterId)}&userId=${this.userId}`;
+    // Le CDN attend : novelId / volumeId / chapterId (tous déjà encodés dans le path)
+    const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${this.userId}`;
 
     try {
       const r = await fetchApi(cdnUrl);
-      if (!r.ok) return `<p>Erreur CDN ${r.status} pour : ${cdnUrl}</p>`;
+      if (!r.ok) return `<p>Erreur CDN ${r.status}</p>`;
 
       const html = await r.text();
       const metaMatch = html.match(/chapitres\/css\?[^"']*?meta=([A-Za-z0-9+/=%-]+)/);
-      if (!metaMatch) return html; // pas d'obfuscation, retourner tel quel
+      if (!metaMatch) return html;
 
       const metaToken = decodeMetaToken(decodeURIComponent(metaMatch[1]));
-      if (!metaToken || !metaToken.visible.length) return `<p>Token de déobfuscation invalide.</p>`;
+      if (!metaToken || !metaToken.visible.length) return `<p>Token invalide.</p>`;
 
       const content = extractObfuscatedContent(html, metaToken);
-      return content.length > 50 ? content : `<p>Contenu vide après extraction.</p>`;
+      return content.length > 50 ? content : `<p>Contenu vide.</p>`;
 
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
