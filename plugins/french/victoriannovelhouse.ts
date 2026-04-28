@@ -217,7 +217,14 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     }).map(e => ({ name: e.title, path: `/oeuvres/${e.id}`, cover: e.image }));
   }
 
-  filters = {} satisfies Filters;
+  filters = {
+  genre: {
+    type: FilterTypes.Picker,
+    label: 'Genre',
+    value: '',
+    options: [{ label: 'Tous', value: '' }],
+  },
+} satisfies Filters;
 }
 
 export default new VictorianNovelHousePlugin();
