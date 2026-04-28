@@ -53,6 +53,76 @@ function parseNovelsFromRSC(raw: string): NovelEntry[] {
   }
 }
 
+/**
+ * Extrait tous les chapitres depuis le RSC, indépendamment de l'ordre des clés JSON.
+ */
+function parseChaptersFromRSC(raw: string): ChapterEntry[] {
+  const results: ChapterEntry[] = [];
+  const seen = new Set<string>();
+
+  // Stratégie 1 : parser les blocs JSON complets contenant "chapterNumber"
+  const chapterBlockRe = /\{[^{}]*"chapterNumber"\s*:\s*\d+[^{}]*\}/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = chapterBlockRe.exec(raw)) !== null) {
+    try {
+      const obj = JSON.parse(m[0]);
+      const id = obj.id;
+      const volumeId = obj.volumeId;
+      const chapterNumber = obj.chapterNumber;
+
+      if (!id || !volumeId || typeof chapterNumber !== 'number') continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+
+      results.push({
+        id,
+        title: obj.title || id,
+        date: obj.date || 0,
+        volumeId,
+        volumeDisplayName: obj.volumeDisplayName || '',
+        chapterNumber,
+      });
+    } catch {}
+  }
+
+  // Stratégie 2 (fallback) : extraction par regex champ par champ
+  if (results.length === 0) {
+    const chunkSize = 600;
+    const idRe = /"id"\s*:\s*"([^"]+)"/g;
+    let idMatch: RegExpExecArray | null;
+
+    while ((idMatch = idRe.exec(raw)) !== null) {
+      const start = Math.max(0, idMatch.index - 100);
+      const end = Math.min(raw.length, idMatch.index + chunkSize);
+      const chunk = raw.slice(start, end);
+
+      const chapterNumMatch = chunk.match(/"chapterNumber"\s*:\s*(\d+)/);
+      const volumeIdMatch = chunk.match(/"volumeId"\s*:\s*"([^"]+)"/);
+      if (!chapterNumMatch || !volumeIdMatch) continue;
+
+      const id = idMatch[1];
+      if (seen.has(id)) continue;
+      seen.add(id);
+
+      const titleMatch = chunk.match(/"title"\s*:\s*"([^"]+)"/);
+      const dateMatch = chunk.match(/"date"\s*:\s*(\d+)/);
+      const volumeDisplayMatch = chunk.match(/"volumeDisplayName"\s*:\s*"([^"]+)"/);
+
+      results.push({
+        id,
+        title: titleMatch ? titleMatch[1] : id,
+        date: dateMatch ? parseInt(dateMatch[1]) : 0,
+        volumeId: volumeIdMatch[1],
+        volumeDisplayName: volumeDisplayMatch ? volumeDisplayMatch[1] : '',
+        chapterNumber: parseInt(chapterNumMatch[1]),
+      });
+    }
+  }
+
+  return results.sort((a, b) => a.chapterNumber - b.chapterNumber);
+}
+
 // ─────────────────────────────────────────────────────────────
 // Types internes
 // ─────────────────────────────────────────────────────────────
@@ -91,9 +161,8 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '1.1.0';
+  version = '1.2.0';
 
-  // Votre userId world-novel.fr
   private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
   private cdnBase = 'https://cdn.world-novel.fr/chapitres';
 
@@ -149,42 +218,26 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     const novelId = novelPath.replace('/oeuvres/', '');
 
     const allNovels = await this.getHomeNovels();
-    let entry = allNovels.find(n => n.id === novelId) || null;
+    const entry = allNovels.find(n => n.id === novelId) || null;
 
     let chapters: Plugin.ChapterItem[] = [];
+
     try {
       const r = await fetchApi(this.site + novelPath);
       const html = await r.text();
       const raw = extractNextFlightData(html);
+      const parsed = parseChaptersFromRSC(raw);
 
-      const results: ChapterEntry[] = [];
-      const re = /"id":"([^"]+)","title":"([^"]+)","date":(\d+),"volumeId":"([^"]+)","volumeDisplayName":"([^"]+)","chapterNumber":(\d+)/g;
-      let m: RegExpExecArray | null;
-      const seen = new Set<string>();
-
-      while ((m = re.exec(raw)) !== null) {
-        const id = m[1];
-        if (seen.has(id)) continue;
-        seen.add(id);
-        results.push({
-          id,
-          title: m[2],
-          date: parseInt(m[3]),
-          volumeId: m[4],
-          volumeDisplayName: m[5],
-          chapterNumber: parseInt(m[6]),
-        });
-      }
-
-      if (results.length > 0) {
-        results.sort((a, b) => a.chapterNumber - b.chapterNumber);
-        chapters = results.map(c => this.chapterToItem(c, novelId));
+      if (parsed.length > 0) {
+        chapters = parsed.map(c => this.chapterToItem(c, novelId));
       }
     } catch {}
 
-    // Fallback : chapitres depuis l'accueil
-    if (!chapters.length && entry) {
-      chapters = entry.chapters.map(c => this.chapterToItem(c, novelId));
+    // Fallback : chapitres depuis la page d'accueil
+    if (!chapters.length && entry?.chapters?.length) {
+      chapters = [...entry.chapters]
+        .sort((a, b) => a.chapterNumber - b.chapterNumber)
+        .map(c => this.chapterToItem(c, novelId));
     }
 
     if (!entry) {
@@ -204,7 +257,6 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    // Extraire novelId, volumeId, chapterId depuis le path
     // Format : /lecture/{novelId}/volumes/{volumeId}/chapitres/{chapterId}
     const match = chapterPath.match(
       /\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/
@@ -227,13 +279,13 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
           }
         } catch {}
 
-        // Réponse HTML / texte brut
+        // Réponse HTML brut
+        if (text.trimStart().startsWith('<') && text.length > 100) {
+          return text;
+        }
+
+        // Texte brut → paragraphes
         if (text.length > 100) {
-          // Si c'est du HTML, on le retourne directement
-          if (text.trimStart().startsWith('<')) {
-            return text;
-          }
-          // Sinon on enveloppe le texte brut dans des paragraphes
           return text
             .split('\n')
             .filter(l => l.trim())
@@ -264,7 +316,6 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
         }
       }
 
-      // Fallback données RSC
       const raw = extractNextFlightData(html);
       const m = raw.match(/"(?:content|text|body)":"([\s\S]{200,}?)(?<!\\)"/);
       if (m) {
@@ -272,7 +323,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
       }
     } catch {}
 
-    return '<p><em>Le contenu de ce chapitre est chargé dynamiquement. Veuillez l\'ouvrir dans le navigateur intégré.</em></p>';
+    return "<p><em>Le contenu de ce chapitre est chargé dynamiquement. Veuillez l'ouvrir dans le navigateur intégré.</em></p>";
   }
 
   async searchNovels(
@@ -282,11 +333,17 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     if (pageNo > 1) return [];
 
     const entries = await this.getHomeNovels();
-    const q = searchTerm.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const q = searchTerm
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
 
     return entries
       .filter(e => {
-        const title = e.title.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const title = e.title
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '');
         const author = (e.auteur || '').toLowerCase();
         const tags = e.tags.join(' ').toLowerCase();
         return title.includes(q) || author.includes(q) || tags.includes(q);
