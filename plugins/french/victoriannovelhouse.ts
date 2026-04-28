@@ -6,7 +6,7 @@ import { load as loadCheerio } from "cheerio";
 export const id = "victorian-novel-house";
 export const name = "Victorian Novel House";
 export const site = "https://world-novel.fr";
-export const version = "1.1.0";
+export const version = "1.1.1";
 export const icon = "src/fr/victorian-novel-house/icon.png";
 
 // ──────────────────────────────────────────────────────────────
