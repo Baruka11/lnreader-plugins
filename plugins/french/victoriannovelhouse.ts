@@ -1,4 +1,3 @@
-import { load } from 'cheerio';
 import { fetchApi } from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
 import { NovelStatus } from '@libs/novelStatus';
@@ -48,6 +47,10 @@ interface MetaToken {
   fake: string[];
   key: string;
 }
+
+// ─────────────────────────────────────────────────────────────
+// RSC Helpers
+// ─────────────────────────────────────────────────────────────
 
 function extractNextFlightData(html: string): string {
   const parts: string[] = [];
@@ -119,116 +122,96 @@ function parseOeuvreMetaFromRSC(raw: string) {
   return meta;
 }
 
-/**
- * Décode le token meta base64 → MetaToken
- */
+// ─────────────────────────────────────────────────────────────
+// Déobfuscation CDN
+// ─────────────────────────────────────────────────────────────
+
 function decodeMetaToken(metaB64: string): MetaToken | null {
   try {
-    const decoded = atob(decodeURIComponent(metaB64));
-    return JSON.parse(decoded) as MetaToken;
+    return JSON.parse(atob(metaB64)) as MetaToken;
   } catch {
     return null;
   }
 }
 
 /**
- * Reconstruit le texte depuis le HTML obfusqué en utilisant les classes "visible".
+ * Reconstruit le texte depuis le HTML obfusqué du CDN.
  *
- * Structure HTML CDN :
- *   <div class="chapter-obf">
- *     <h2>...</h2>
- *     <span class="CLS">lettre</span>
- *     <span class="CLS">lettre</span>
- *     <br>
- *     ...
- *   </div>
- *
- * Chaque span contient UNE lettre. Les classes dans meta.visible sont celles à garder.
- * Les classes dans meta.hiddenSpace correspondent à des espaces cachés.
- * On ignore hidden et fake.
+ * Règles :
+ *  - <span class="CLS">X</span>  où CLS ∈ visible  → ajouter X (ou espace si X vide)
+ *  - <span class="CLS">X</span>  où CLS ∈ hidden/hiddenSpace/fake → ignorer
+ *  - <br><br> → nouveau paragraphe
+ *  - <em>...</em> → italique
+ *  - <h2>...</h2> → ignoré (titre déjà connu)
  */
 function extractObfuscatedContent(html: string, meta: MetaToken): string {
-  const $ = load(html);
   const visibleSet = new Set(meta.visible);
 
-  const container = $('.chapter-obf');
-  if (!container.length) return '';
+  // Se concentrer sur <div class="chapter-obf">
+  const start = html.indexOf('<div class="chapter-obf">');
+  const end = html.lastIndexOf('</div>');
+  const src = start !== -1 ? html.slice(start, end + 6) : html;
+
+  // Regex pour extraire tous les spans et les <br>
+  // On traite le HTML comme une séquence de tokens
+  const tokenRe = /<span class="([^"]+)">([\s\S]*?)<\/span>|<br>|<em>|<\/em>|<h2>|<\/h2>|<\/div>/g;
 
   const paragraphs: string[] = [];
-  let currentText = '';
-  let inEm = false;
+  let current = '';
+  let inItalic = false;
+  let inH2 = false;
+  let lastWasBr = false;
+  let match: RegExpExecArray | null;
 
-  // Parcourir tous les nœuds enfants de .chapter-obf
-  container.contents().each((_, node) => {
-    if (node.type === 'tag') {
-      const tag = (node as cheerio.TagElement).name;
+  while ((match = tokenRe.exec(src)) !== null) {
+    const full = match[0];
 
-      if (tag === 'br') {
-        // Fin de paragraphe : on flush
-        const trimmed = currentText.trim();
-        if (trimmed) {
-          if (inEm) {
-            paragraphs.push(`<p><em>${trimmed}</em></p>`);
-          } else {
-            paragraphs.push(`<p>${trimmed}</p>`);
-          }
-          currentText = '';
-          inEm = false;
-        }
-        return;
+    if (full === '<h2>') { inH2 = true; lastWasBr = false; continue; }
+    if (full === '</h2>') { inH2 = false; continue; }
+    if (full === '<em>') { inItalic = true; continue; }
+    if (full === '</em>') { inItalic = false; continue; }
+    if (full === '</div>') { break; }
+
+    if (full === '<br>') {
+      if (lastWasBr) {
+        // Double <br> = fin de paragraphe
+        const trimmed = current.trim();
+        if (trimmed) paragraphs.push(`<p>${trimmed}</p>`);
+        current = '';
       }
+      lastWasBr = true;
+      continue;
+    }
 
-      if (tag === 'span') {
-        const cls = ($(node).attr('class') || '').trim();
-        if (visibleSet.has(cls)) {
-          currentText += $(node).text();
-        }
-        // hidden, hiddenSpace, fake → ignorés
-        return;
-      }
+    // C'est un <span>
+    lastWasBr = false;
+    if (inH2) continue; // ignorer le titre h2
 
-      if (tag === 'em') {
-        // Balise italique : extraire ses spans visibles
-        inEm = true;
-        $(node).find('span').each((_, span) => {
-          const cls = ($(span).attr('class') || '').trim();
-          if (visibleSet.has(cls)) {
-            currentText += $(span).text();
-          }
-        });
-        return;
-      }
+    const cls = match[1];
+    const content = match[2];
 
-      if (tag === 'h2') {
-        // Titre du chapitre
-        let titleText = '';
-        $(node).find('span').each((_, span) => {
-          const cls = ($(span).attr('class') || '').trim();
-          if (visibleSet.has(cls)) {
-            titleText += $(span).text();
-          }
-        });
-        if (titleText.trim()) {
-          paragraphs.push(`<h2>${titleText.trim()}</h2>`);
-        }
-        return;
-      }
-
-      if (tag === 'div') {
-        // Div notice (copyright) → ignorer
-        return;
+    if (visibleSet.has(cls)) {
+      // contenu vide dans un span visible = espace
+      const text = content !== '' ? content : ' ';
+      if (inItalic) {
+        current += `<em>${text}</em>`;
+      } else {
+        current += text;
       }
     }
-  });
-
-  // Flush le dernier paragraphe si non vide
-  const lastTrimmed = currentText.trim();
-  if (lastTrimmed) {
-    paragraphs.push(inEm ? `<p><em>${lastTrimmed}</em></p>` : `<p>${lastTrimmed}</p>`);
+    // hidden / hiddenSpace / fake → ignoré
   }
+
+  // Dernier paragraphe
+  const last = current.trim();
+  if (last) paragraphs.push(`<p>${last}</p>`);
 
   return paragraphs.join('\n');
 }
+
+// ─────────────────────────────────────────────────────────────
+// Plugin
+// ─────────────────────────────────────────────────────────────
 
 class VictorianNovelHousePlugin implements Plugin.PluginBase {
   id = 'victoriannovelhouse';
@@ -326,7 +309,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
 
   async parseChapter(chapterPath: string): Promise<string> {
     const match = chapterPath.match(
-      /\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/
+      /\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/,
     );
     if (!match) return '<p>Chemin de chapitre invalide.</p>';
 
@@ -335,24 +318,29 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
 
     try {
       const r = await fetchApi(cdnUrl);
-      if (!r.ok) throw new Error(`CDN status ${r.status}`);
+      if (!r.ok) throw new Error(`CDN HTTP ${r.status}`);
       const html = await r.text();
 
-      // Extraire le token meta depuis le lien CSS
-      // Format : <link rel="stylesheet" href="...chapitres/css?path=...&meta=BASE64">
-      const metaMatch = html.match(/chapitres\/css\?[^"']*?meta=([A-Za-z0-9+/=%]+)/);
-      if (!metaMatch) throw new Error('Token meta introuvable');
+      // Extraire le token meta= depuis le <link> vers le CSS
+      const metaMatch = html.match(/chapitres\/css\?[^"']*?meta=([A-Za-z0-9+/=%-]+)/);
+      if (!metaMatch) {
+        // Pas d'obfuscation — retourner le HTML brut
+        return html;
+      }
 
-      const metaToken = decodeMetaToken(metaMatch[1]);
-      if (!metaToken || !metaToken.visible.length) throw new Error('Token meta invalide');
+      const metaB64 = decodeURIComponent(metaMatch[1]);
+      const metaToken = decodeMetaToken(metaB64);
+      if (!metaToken || metaToken.visible.length === 0) {
+        return '<p>Impossible de décoder le token de déobfuscation.</p>';
+      }
 
       const content = extractObfuscatedContent(html, metaToken);
       if (content.length > 50) return content;
 
-      throw new Error('Contenu vide après déobfuscation');
+      return '<p>Le contenu du chapitre est vide après déobfuscation.</p>';
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      return `<p>Erreur lors du chargement du chapitre : ${msg}</p>`;
+      return `<p>Erreur lors du chargement : ${msg}</p>`;
     }
   }
 
