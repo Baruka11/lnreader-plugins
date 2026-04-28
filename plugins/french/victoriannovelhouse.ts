@@ -118,7 +118,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '3.0.0';
+  version = '3.0.1';
 
   private cachedNovels: HomeNovelEntry[] | null = null;
 
