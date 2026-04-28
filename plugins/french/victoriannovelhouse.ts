@@ -41,6 +41,14 @@ interface HomeNovelEntry {
   tags: string[];
 }
 
+interface MetaToken {
+  visible: string[];
+  hidden: string[];
+  hiddenSpace: string[];
+  fake: string[];
+  key: string;
+}
+
 function extractNextFlightData(html: string): string {
   const parts: string[] = [];
   const re = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
@@ -111,12 +119,123 @@ function parseOeuvreMetaFromRSC(raw: string) {
   return meta;
 }
 
+/**
+ * Décode le token meta base64 → MetaToken
+ */
+function decodeMetaToken(metaB64: string): MetaToken | null {
+  try {
+    const decoded = atob(decodeURIComponent(metaB64));
+    return JSON.parse(decoded) as MetaToken;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reconstruit le texte depuis le HTML obfusqué en utilisant les classes "visible".
+ *
+ * Structure HTML CDN :
+ *   <div class="chapter-obf">
+ *     <h2>...</h2>
+ *     <span class="CLS">lettre</span>
+ *     <span class="CLS">lettre</span>
+ *     <br>
+ *     ...
+ *   </div>
+ *
+ * Chaque span contient UNE lettre. Les classes dans meta.visible sont celles à garder.
+ * Les classes dans meta.hiddenSpace correspondent à des espaces cachés.
+ * On ignore hidden et fake.
+ */
+function extractObfuscatedContent(html: string, meta: MetaToken): string {
+  const $ = load(html);
+  const visibleSet = new Set(meta.visible);
+
+  const container = $('.chapter-obf');
+  if (!container.length) return '';
+
+  const paragraphs: string[] = [];
+  let currentText = '';
+  let inEm = false;
+
+  // Parcourir tous les nœuds enfants de .chapter-obf
+  container.contents().each((_, node) => {
+    if (node.type === 'tag') {
+      const tag = (node as cheerio.TagElement).name;
+
+      if (tag === 'br') {
+        // Fin de paragraphe : on flush
+        const trimmed = currentText.trim();
+        if (trimmed) {
+          if (inEm) {
+            paragraphs.push(`<p><em>${trimmed}</em></p>`);
+          } else {
+            paragraphs.push(`<p>${trimmed}</p>`);
+          }
+          currentText = '';
+          inEm = false;
+        }
+        return;
+      }
+
+      if (tag === 'span') {
+        const cls = ($(node).attr('class') || '').trim();
+        if (visibleSet.has(cls)) {
+          currentText += $(node).text();
+        }
+        // hidden, hiddenSpace, fake → ignorés
+        return;
+      }
+
+      if (tag === 'em') {
+        // Balise italique : extraire ses spans visibles
+        inEm = true;
+        $(node).find('span').each((_, span) => {
+          const cls = ($(span).attr('class') || '').trim();
+          if (visibleSet.has(cls)) {
+            currentText += $(span).text();
+          }
+        });
+        return;
+      }
+
+      if (tag === 'h2') {
+        // Titre du chapitre
+        let titleText = '';
+        $(node).find('span').each((_, span) => {
+          const cls = ($(span).attr('class') || '').trim();
+          if (visibleSet.has(cls)) {
+            titleText += $(span).text();
+          }
+        });
+        if (titleText.trim()) {
+          paragraphs.push(`<h2>${titleText.trim()}</h2>`);
+        }
+        return;
+      }
+
+      if (tag === 'div') {
+        // Div notice (copyright) → ignorer
+        return;
+      }
+    }
+  });
+
+  // Flush le dernier paragraphe si non vide
+  const lastTrimmed = currentText.trim();
+  if (lastTrimmed) {
+    paragraphs.push(inEm ? `<p><em>${lastTrimmed}</em></p>` : `<p>${lastTrimmed}</p>`);
+  }
+
+  return paragraphs.join('\n');
+}
+
 class VictorianNovelHousePlugin implements Plugin.PluginBase {
   id = 'victoriannovelhouse';
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '1.6.0-debug';
+  version = '2.0.0';
 
   private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
   private cdnBase = 'https://cdn.world-novel.fr/chapitres';
@@ -133,7 +252,10 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     return this.cachedNovels;
   }
 
-  async popularNovels(pageNo: number, { showLatestNovels }: Plugin.PopularNovelsOptions<typeof this.filters>): Promise<Plugin.NovelItem[]> {
+  async popularNovels(
+    pageNo: number,
+    { showLatestNovels }: Plugin.PopularNovelsOptions<typeof this.filters>,
+  ): Promise<Plugin.NovelItem[]> {
     if (pageNo > 1) return [];
     const entries = await this.getHomeNovels();
     if (!entries.length) return [];
@@ -166,119 +288,84 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
             });
           }
         }
-        return { path: novelPath, name: meta.title || novelId, cover: meta.image, summary: meta.description, author: meta.auteur, genres: meta.genre, status: NovelStatus.Unknown, chapters };
+        return {
+          path: novelPath,
+          name: meta.title || novelId,
+          cover: meta.image,
+          summary: meta.description,
+          author: meta.auteur,
+          genres: meta.genre,
+          status: NovelStatus.Unknown,
+          chapters,
+        };
       }
     } catch {}
+
     const allNovels = await this.getHomeNovels();
     const entry = allNovels.find(n => n.id === novelId);
     if (!entry) return { path: novelPath, name: novelId, chapters: [] };
-    const chapters = [...entry.chapters].sort((a, b) => a.chapterNumber - b.chapterNumber).map((c, i) => ({
-      name: c.title || c.id,
-      path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
-      releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
-      chapterNumber: c.chapterNumber || i + 1,
-    }));
-    return { path: novelPath, name: entry.title, cover: entry.image, summary: entry.desc, author: entry.auteur, genres: entry.genre, status: NovelStatus.Unknown, chapters };
+    const chapters = [...entry.chapters]
+      .sort((a, b) => a.chapterNumber - b.chapterNumber)
+      .map((c, i) => ({
+        name: c.title || c.id,
+        path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
+        releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
+        chapterNumber: c.chapterNumber || i + 1,
+      }));
+    return {
+      path: novelPath,
+      name: entry.title,
+      cover: entry.image,
+      summary: entry.desc,
+      author: entry.auteur,
+      genres: entry.genre,
+      status: NovelStatus.Unknown,
+      chapters,
+    };
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const debugLines: string[] = [`<h3>DEBUG parseChapter</h3>`, `<p>chapterPath = <code>${chapterPath}</code></p>`];
+    const match = chapterPath.match(
+      /\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/
+    );
+    if (!match) return '<p>Chemin de chapitre invalide.</p>';
 
-    const match = chapterPath.match(/\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/);
+    const [, novelId, volumeId, chapterId] = match;
+    const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${this.userId}`;
 
-    if (!match) {
-      debugLines.push(`<p>❌ Regex non matchée</p>`);
-    } else {
-      const [, novelId, volumeId, chapterId] = match;
-      debugLines.push(`<p>novelId = ${novelId}<br>volumeId = ${volumeId}<br>chapterId = ${chapterId}</p>`);
+    try {
+      const r = await fetchApi(cdnUrl);
+      if (!r.ok) throw new Error(`CDN status ${r.status}`);
+      const html = await r.text();
 
-      // Test CDN
-      const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${this.userId}`;
-      debugLines.push(`<p>CDN URL = <code>${cdnUrl}</code></p>`);
+      // Extraire le token meta depuis le lien CSS
+      // Format : <link rel="stylesheet" href="...chapitres/css?path=...&meta=BASE64">
+      const metaMatch = html.match(/chapitres\/css\?[^"']*?meta=([A-Za-z0-9+/=%]+)/);
+      if (!metaMatch) throw new Error('Token meta introuvable');
 
-      try {
-        const r = await fetchApi(cdnUrl);
-        debugLines.push(`<p>CDN status = ${r.status}</p>`);
-        const text = await r.text();
-        debugLines.push(`<p>CDN réponse (200 premiers chars) = <code>${text.slice(0, 200).replace(/</g, '&lt;')}</code></p>`);
+      const metaToken = decodeMetaToken(metaMatch[1]);
+      if (!metaToken || !metaToken.visible.length) throw new Error('Token meta invalide');
 
-        if (r.ok && text.length > 100) {
-          // Tenter JSON
-          try {
-            const json = JSON.parse(text);
-            const keys = Object.keys(json).join(', ');
-            debugLines.push(`<p>JSON keys = ${keys}</p>`);
-            const content = json.content ?? json.text ?? json.body ?? json.html ?? json.data ?? '';
-            if (typeof content === 'string' && content.length > 50) {
-              return content.replace(/\\n/g, '\n').replace(/\\"/g, '"');
-            }
-            // Chercher récursivement une longue chaîne
-            for (const [k, v] of Object.entries(json)) {
-              if (typeof v === 'string' && v.length > 100) {
-                debugLines.push(`<p>Contenu trouvé dans clé "${k}"</p>`);
-                return (v as string).replace(/\\n/g, '\n').replace(/\\"/g, '"');
-              }
-            }
-          } catch {
-            debugLines.push(`<p>Pas du JSON</p>`);
-          }
+      const content = extractObfuscatedContent(html, metaToken);
+      if (content.length > 50) return content;
 
-          if (text.trimStart().startsWith('<')) {
-            debugLines.push(`<p>Réponse HTML directe</p>`);
-            return text;
-          }
-
-          if (text.length > 100) {
-            return text.split('\n').filter(l => l.trim()).map(l => `<p>${l.trim()}</p>`).join('\n');
-          }
-        }
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        debugLines.push(`<p>❌ Erreur CDN : ${msg}</p>`);
-      }
-
-      // Test page web
-      const webUrl = this.site + chapterPath;
-      debugLines.push(`<p>Fallback page web : <code>${webUrl}</code></p>`);
-      try {
-        const r2 = await fetchApi(webUrl);
-        debugLines.push(`<p>Web status = ${r2.status}</p>`);
-        const html = await r2.text();
-        debugLines.push(`<p>HTML length = ${html.length}</p>`);
-        const $ = load(html);
-        for (const sel of ['.chapter-content', '[class*="chapterContent"]', '[class*="chapter-text"]', '.prose', 'article', 'main']) {
-          const el = $(sel);
-          if (el.length && el.text().trim().length > 200) {
-            debugLines.push(`<p>✅ Contenu trouvé via sélecteur CSS "${sel}"</p>`);
-            return `${debugLines.join('\n')}\n<hr>${el.html() || ''}`;
-          }
-        }
-        debugLines.push(`<p>Aucun sélecteur CSS n'a trouvé de contenu</p>`);
-        const raw = extractNextFlightData(html);
-        debugLines.push(`<p>RSC length = ${raw.length}</p>`);
-        const contentM = raw.match(/"(?:content|text|body|html)"\s*:\s*"([\s\S]{200,}?)(?<!\\)"/);
-        if (contentM) {
-          debugLines.push(`<p>✅ Contenu trouvé dans RSC</p>`);
-          return contentM[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-        }
-        debugLines.push(`<p>Extrait RSC (500 chars) = <code>${raw.slice(0, 500).replace(/</g, '&lt;')}</code></p>`);
-      } catch (e2: unknown) {
-        const msg = e2 instanceof Error ? e2.message : String(e2);
-        debugLines.push(`<p>❌ Erreur web : ${msg}</p>`);
-      }
+      throw new Error('Contenu vide après déobfuscation');
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return `<p>Erreur lors du chargement du chapitre : ${msg}</p>`;
     }
-
-    return debugLines.join('\n');
   }
 
   async searchNovels(searchTerm: string, pageNo: number): Promise<Plugin.NovelItem[]> {
     if (pageNo > 1) return [];
     const entries = await this.getHomeNovels();
     const q = searchTerm.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    return entries.filter(e => {
-      const title = e.title.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-      return title.includes(q) || (e.auteur || '').toLowerCase().includes(q);
-    }).map(e => ({ name: e.title, path: `/oeuvres/${e.id}`, cover: e.image }));
+    return entries
+      .filter(e => {
+        const title = e.title.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        return title.includes(q) || (e.auteur || '').toLowerCase().includes(q);
+      })
+      .map(e => ({ name: e.title, path: `/oeuvres/${e.id}`, cover: e.image }));
   }
 
   filters = {
@@ -286,7 +373,17 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
       type: FilterTypes.Picker,
       label: 'Genre',
       value: '',
-      options: [{ label: 'Tous', value: '' }],
+      options: [
+        { label: 'Tous', value: '' },
+        { label: 'Action', value: 'Action' },
+        { label: 'Aventure', value: 'Aventure' },
+        { label: 'Fantaisie', value: 'Fantais' },
+        { label: 'Mystère', value: 'Mystère' },
+        { label: 'Romance', value: 'Romance' },
+        { label: 'Système / LitRPG', value: 'Système' },
+        { label: 'Science-fiction', value: 'Science' },
+        { label: 'Surnaturel', value: 'Surnaturel' },
+      ],
     },
   } satisfies Filters;
 }
