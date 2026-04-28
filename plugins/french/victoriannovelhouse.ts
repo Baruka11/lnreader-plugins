@@ -18,6 +18,10 @@ interface MetaToken {
   visible: string[]; hidden: string[]; hiddenSpace: string[]; fake: string[]; key: string;
 }
 
+const FIREBASE_API_KEY = 'AIzaSyAvcYUE1unj_VAlqxpYUtBfk9C2Ah-XzpI';
+const USER_EMAIL = 'leclercqsimon12@gmail.com';
+const USER_ID = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
+
 function extractNextFlightData(html: string): string {
   const parts: string[] = [];
   const re = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
@@ -115,11 +119,34 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '2.2.0';
+  version = '2.4.0';
 
-  private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
   private cdnBase = 'https://cdn.world-novel.fr/chapitres';
   private cachedNovels: HomeNovelEntry[] | null = null;
+  private authToken: string | null = null;
+  private authTokenExpiry = 0;
+
+  private async getAuthToken(password: string): Promise<string> {
+    const now = Date.now();
+    if (this.authToken && now < this.authTokenExpiry - 60000) {
+      return this.authToken;
+    }
+    const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`;
+    const r = await fetchApi(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: USER_EMAIL,
+        password: password,
+        returnSecureToken: true,
+      }),
+    });
+    if (!r.ok) throw new Error(`Auth échouée (mot de passe incorrect ?) : ${r.status}`);
+    const data = await r.json() as { idToken: string; expiresIn: string };
+    this.authToken = data.idToken;
+    this.authTokenExpiry = now + parseInt(data.expiresIn) * 1000;
+    return this.authToken;
+  }
 
   private async getHomeNovels(): Promise<HomeNovelEntry[]> {
     if (this.cachedNovels) return this.cachedNovels;
@@ -152,7 +179,6 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
         let n = 1;
         for (const vol of [...volumes].reverse()) {
           for (const ch of [...vol.chapters].sort((a, b) => (a.ts || 0) - (b.ts || 0))) {
-            // On utilise volumeId (ID interne) car c'est ce que le CDN attend réellement
             chapters.push({
               name: ch.title || ch.id,
               path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
@@ -161,19 +187,9 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
             });
           }
         }
-        return {
-          path: novelPath,
-          name: meta.title || novelId,
-          cover: meta.image,
-          summary: meta.description,
-          author: meta.auteur,
-          genres: meta.genre,
-          status: NovelStatus.Unknown,
-          chapters,
-        };
+        return { path: novelPath, name: meta.title || novelId, cover: meta.image, summary: meta.description, author: meta.auteur, genres: meta.genre, status: NovelStatus.Unknown, chapters };
       }
     } catch {}
-
     const entry = (await this.getHomeNovels()).find(n => n.id === novelId);
     if (!entry) return { path: novelPath, name: novelId, chapters: [] };
     return {
@@ -188,17 +204,29 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     };
   }
 
-  async parseChapter(chapterPath: string): Promise<string> {
+  async parseChapter(
+    chapterPath: string,
+    { filters }: Plugin.ParseChapterOptions<typeof this.filters>,
+  ): Promise<string> {
+    const password = filters?.password?.value as string || '';
+    if (!password) {
+      return `<p>⚠️ Veuillez entrer votre mot de passe Victorian Novel House dans les filtres du plugin (icône entonnoir).</p>`;
+    }
+
     const match = chapterPath.match(/\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/);
     if (!match) return `<p>Chemin invalide : ${chapterPath}</p>`;
 
     const [, novelId, volumeId, chapterId] = match;
-
-    // Le CDN attend : novelId / volumeId / chapterId (tous déjà encodés dans le path)
-    const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${this.userId}`;
+    const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${USER_ID}`;
 
     try {
-      const r = await fetchApi(cdnUrl);
+      const token = await this.getAuthToken(password);
+      const r = await fetchApi(cdnUrl, {
+        headers: {
+          'authorization': `Bearer ${token}`,
+          'referer': 'https://world-novel.fr/',
+        },
+      });
       if (!r.ok) return `<p>Erreur CDN ${r.status}</p>`;
 
       const html = await r.text();
@@ -227,7 +255,11 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   }
 
   filters = {
-    genre: { type: FilterTypes.Picker, label: 'Genre', value: '', options: [{ label: 'Tous', value: '' }] },
+    password: {
+      type: FilterTypes.TextInput,
+      label: 'Mot de passe Victorian Novel House',
+      value: '',
+    },
   } satisfies Filters;
 }
 
