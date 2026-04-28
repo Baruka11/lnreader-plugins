@@ -115,7 +115,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '2.0.1-debug';
+  version = '2.1.0';
 
   private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
   private cdnBase = 'https://cdn.world-novel.fr/chapitres';
@@ -152,17 +152,31 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
         let n = 1;
         for (const vol of [...volumes].reverse()) {
           for (const ch of [...vol.chapters].sort((a, b) => (a.ts || 0) - (b.ts || 0))) {
+            // ⚠️ On utilise volumeDisplayName (pas volumeId) car le CDN attend le nom affiché
+            // On stocke: novelId/volumeDisplayName/chapterId séparés par §
+            // pour pouvoir les récupérer proprement dans parseChapter
             chapters.push({
               name: ch.title || ch.id,
-              path: `/lecture/${novelId}/volumes/${encodeURIComponent(ch.volumeId)}/chapitres/${encodeURIComponent(ch.id)}`,
+              path: `/cdnchapter/${encodeURIComponent(novelId)}§${encodeURIComponent(ch.volumeDisplayName)}§${encodeURIComponent(ch.id)}`,
               releaseTime: ch.ts ? new Date(ch.ts).toISOString() : undefined,
               chapterNumber: n++,
             });
           }
         }
-        return { path: novelPath, name: meta.title || novelId, cover: meta.image, summary: meta.description, author: meta.auteur, genres: meta.genre, status: NovelStatus.Unknown, chapters };
+        return {
+          path: novelPath,
+          name: meta.title || novelId,
+          cover: meta.image,
+          summary: meta.description,
+          author: meta.auteur,
+          genres: meta.genre,
+          status: NovelStatus.Unknown,
+          chapters,
+        };
       }
     } catch {}
+
+    // Fallback accueil
     const entry = (await this.getHomeNovels()).find(n => n.id === novelId);
     if (!entry) return { path: novelPath, name: novelId, chapters: [] };
     return {
@@ -170,7 +184,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
       author: entry.auteur, genres: entry.genre, status: NovelStatus.Unknown,
       chapters: [...entry.chapters].sort((a, b) => a.chapterNumber - b.chapterNumber).map((c, i) => ({
         name: c.title || c.id,
-        path: `/lecture/${novelId}/volumes/${encodeURIComponent(c.volumeId)}/chapitres/${encodeURIComponent(c.id)}`,
+        path: `/cdnchapter/${encodeURIComponent(novelId)}§${encodeURIComponent(c.volumeDisplayName)}§${encodeURIComponent(c.id)}`,
         releaseTime: c.date ? new Date(c.date).toISOString() : undefined,
         chapterNumber: c.chapterNumber || i + 1,
       })),
@@ -178,52 +192,34 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const dbg: string[] = [];
-    dbg.push(`<h3>DEBUG v2.0.1</h3>`);
-    dbg.push(`<p><b>chapterPath:</b> <code>${chapterPath}</code></p>`);
+    // Format: /cdnchapter/novelId§volumeDisplayName§chapterId
+    const cdnMatch = chapterPath.match(/^\/cdnchapter\/([^§]+)§([^§]+)§(.+)$/);
+    if (!cdnMatch) return `<p>Chemin invalide : ${chapterPath}</p>`;
 
-    const match = chapterPath.match(/\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/);
-    if (!match) return `<p>Regex non matchée sur : ${chapterPath}</p>`;
+    const novelId = decodeURIComponent(cdnMatch[1]);
+    const volumeDisplayName = decodeURIComponent(cdnMatch[2]);
+    const chapterId = decodeURIComponent(cdnMatch[3]);
 
-    const [, novelId, volumeId, chapterId] = match;
-    const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${this.userId}`;
-    dbg.push(`<p><b>CDN URL:</b> <code>${cdnUrl}</code></p>`);
+    // Le CDN attend : path=novelId/volumeDisplayName/chapterId
+    const cdnUrl = `${this.cdnBase}/?path=${encodeURIComponent(novelId)}/${encodeURIComponent(volumeDisplayName)}/${encodeURIComponent(chapterId)}&userId=${this.userId}`;
 
     try {
       const r = await fetchApi(cdnUrl);
-      dbg.push(`<p><b>Status HTTP:</b> ${r.status}</p>`);
+      if (!r.ok) return `<p>Erreur CDN ${r.status} pour : ${cdnUrl}</p>`;
 
       const html = await r.text();
-      dbg.push(`<p><b>HTML length:</b> ${html.length}</p>`);
-      dbg.push(`<p><b>HTML début (300c):</b> <pre>${html.slice(0, 300).replace(/</g, '&lt;')}</pre></p>`);
-
-      if (!r.ok) return dbg.join('\n') + `<p>Erreur HTTP ${r.status}</p>`;
-
       const metaMatch = html.match(/chapitres\/css\?[^"']*?meta=([A-Za-z0-9+/=%-]+)/);
-      dbg.push(`<p><b>metaMatch trouvé:</b> ${!!metaMatch}</p>`);
+      if (!metaMatch) return html; // pas d'obfuscation, retourner tel quel
 
-      if (!metaMatch) return dbg.join('\n') + `<p>Token meta= non trouvé dans le HTML</p>`;
-
-      const metaB64 = decodeURIComponent(metaMatch[1]);
-      dbg.push(`<p><b>meta base64 (50c):</b> ${metaB64.slice(0, 50)}</p>`);
-
-      const metaToken = decodeMetaToken(metaB64);
-      dbg.push(`<p><b>metaToken décodé:</b> ${!!metaToken}, visible count: ${metaToken?.visible?.length}</p>`);
-
-      if (!metaToken || !metaToken.visible.length) return dbg.join('\n') + `<p>Token invalide</p>`;
+      const metaToken = decodeMetaToken(decodeURIComponent(metaMatch[1]));
+      if (!metaToken || !metaToken.visible.length) return `<p>Token de déobfuscation invalide.</p>`;
 
       const content = extractObfuscatedContent(html, metaToken);
-      dbg.push(`<p><b>Contenu extrait (length):</b> ${content.length}</p>`);
-      dbg.push(`<p><b>Extrait (500c):</b> ${content.slice(0, 500)}</p>`);
-      dbg.push(`<hr>`);
-
-      if (content.length > 50) return dbg.join('\n') + content;
-      return dbg.join('\n') + `<p>Contenu vide après extraction</p>`;
+      return content.length > 50 ? content : `<p>Contenu vide après extraction.</p>`;
 
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      dbg.push(`<p><b>EXCEPTION:</b> ${msg}</p>`);
-      return dbg.join('\n');
+      return `<p>Erreur : ${msg}</p>`;
     }
   }
 
