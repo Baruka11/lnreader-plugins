@@ -18,8 +18,7 @@ interface MetaToken {
   visible: string[]; hidden: string[]; hiddenSpace: string[]; fake: string[]; key: string;
 }
 
-const FIREBASE_API_KEY = 'AIzaSyAvcYUE1unj_VAlqxpYUtBfk9C2Ah-XzpI';
-const USER_EMAIL = 'leclercqsimon12@gmail.com';
+const PROXY_URL = 'https://vnh-proxy.leclercqsimon18.workers.dev';
 const USER_ID = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
 
 function extractNextFlightData(html: string): string {
@@ -119,33 +118,9 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '2.5.0';
+  version = '3.0.0';
 
-  private cdnBase = 'https://cdn.world-novel.fr/chapitres';
   private cachedNovels: HomeNovelEntry[] | null = null;
-  private authToken: string | null = null;
-  private authTokenExpiry = 0;
-  // Le mot de passe est sauvegardé ici quand popularNovels est appelé avec les filtres
-  private savedPassword = '';
-
-  private async getAuthToken(): Promise<string> {
-    const now = Date.now();
-    if (this.authToken && now < this.authTokenExpiry - 60000) {
-      return this.authToken;
-    }
-    if (!this.savedPassword) throw new Error('Mot de passe non configuré');
-    const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`;
-    const r = await fetchApi(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: USER_EMAIL, password: this.savedPassword, returnSecureToken: true }),
-    });
-    if (!r.ok) throw new Error(`Auth échouée (mot de passe incorrect ?) : ${r.status}`);
-    const data = await r.json() as { idToken: string; expiresIn: string };
-    this.authToken = data.idToken;
-    this.authTokenExpiry = now + parseInt(data.expiresIn) * 1000;
-    return this.authToken;
-  }
 
   private async getHomeNovels(): Promise<HomeNovelEntry[]> {
     if (this.cachedNovels) return this.cachedNovels;
@@ -157,14 +132,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     return this.cachedNovels;
   }
 
-  async popularNovels(
-    pageNo: number,
-    { showLatestNovels, filters }: Plugin.PopularNovelsOptions<typeof this.filters>,
-  ): Promise<Plugin.NovelItem[]> {
-    // Sauvegarder le mot de passe pour les appels suivants
-    const pwd = filters?.password?.value as string;
-    if (pwd) this.savedPassword = pwd;
-
+  async popularNovels(pageNo: number, { showLatestNovels }: Plugin.PopularNovelsOptions<typeof this.filters>): Promise<Plugin.NovelItem[]> {
     if (pageNo > 1) return [];
     const entries = await this.getHomeNovels();
     if (!entries.length) return [];
@@ -213,25 +181,16 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    if (!this.savedPassword) {
-      return `<p>⚠️ Configurez votre mot de passe dans les filtres du plugin (bouton "Filtre" sur la page d'accueil du plugin), puis revenez.</p>`;
-    }
-
     const match = chapterPath.match(/\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/);
     if (!match) return `<p>Chemin invalide : ${chapterPath}</p>`;
 
     const [, novelId, volumeId, chapterId] = match;
-    const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${USER_ID}`;
+    // Appel au proxy Cloudflare Worker
+    const proxyUrl = `${PROXY_URL}?path=${novelId}/${volumeId}/${chapterId}&userId=${USER_ID}`;
 
     try {
-      const token = await this.getAuthToken();
-      const r = await fetchApi(cdnUrl, {
-        headers: {
-          'authorization': `Bearer ${token}`,
-          'referer': 'https://world-novel.fr/',
-        },
-      });
-      if (!r.ok) return `<p>Erreur CDN ${r.status}</p>`;
+      const r = await fetchApi(proxyUrl);
+      if (!r.ok) return `<p>Erreur proxy ${r.status} : ${await r.text()}</p>`;
 
       const html = await r.text();
       const metaMatch = html.match(/chapitres\/css\?[^"']*?meta=([A-Za-z0-9+/=%-]+)/);
@@ -258,13 +217,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     }).map(e => ({ name: e.title, path: `/oeuvres/${e.id}`, cover: e.image }));
   }
 
-  filters = {
-    password: {
-      type: FilterTypes.TextInput,
-      label: 'Mot de passe Victorian Novel House',
-      value: '',
-    },
-  } satisfies Filters;
+  filters = {} satisfies Filters;
 }
 
 export default new VictorianNovelHousePlugin();
