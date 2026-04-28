@@ -91,7 +91,11 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   name = 'Victorian Novel House';
   icon = 'src/fr/victoriannovelhouse/icon.png';
   site = 'https://world-novel.fr';
-  version = '1.0.0';
+  version = '1.1.0';
+
+  // Votre userId world-novel.fr
+  private userId = 'FMWkEHmNArbpfkfgEb4xjNbCbL73';
+  private cdnBase = 'https://cdn.world-novel.fr/chapitres';
 
   private cachedNovels: NovelEntry[] | null = null;
 
@@ -147,14 +151,12 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
     const allNovels = await this.getHomeNovels();
     let entry = allNovels.find(n => n.id === novelId) || null;
 
-    // Tenter de récupérer plus de chapitres depuis la page du roman
     let chapters: Plugin.ChapterItem[] = [];
     try {
       const r = await fetchApi(this.site + novelPath);
       const html = await r.text();
       const raw = extractNextFlightData(html);
 
-      // Extraire tous les chapitres par regex
       const results: ChapterEntry[] = [];
       const re = /"id":"([^"]+)","title":"([^"]+)","date":(\d+),"volumeId":"([^"]+)","volumeDisplayName":"([^"]+)","chapterNumber":(\d+)/g;
       let m: RegExpExecArray | null;
@@ -180,7 +182,7 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
       }
     } catch {}
 
-    // Fallback : 5 derniers chapitres depuis l'accueil
+    // Fallback : chapitres depuis l'accueil
     if (!chapters.length && entry) {
       chapters = entry.chapters.map(c => this.chapterToItem(c, novelId));
     }
@@ -202,31 +204,73 @@ class VictorianNovelHousePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const r = await fetchApi(this.site + chapterPath);
-    const html = await r.text();
-    const $ = load(html);
+    // Extraire novelId, volumeId, chapterId depuis le path
+    // Format : /lecture/{novelId}/volumes/{volumeId}/chapitres/{chapterId}
+    const match = chapterPath.match(
+      /\/lecture\/([^/]+)\/volumes\/([^/]+)\/chapitres\/([^/]+)/
+    );
 
-    const selectors = [
-      '.chapter-content',
-      '[class*="chapterContent"]',
-      '[class*="chapter-text"]',
-      '.prose',
-      'article',
-    ];
+    if (match) {
+      const [, novelId, volumeId, chapterId] = match;
+      const cdnUrl = `${this.cdnBase}/?path=${novelId}/${volumeId}/${chapterId}&userId=${this.userId}`;
 
-    for (const sel of selectors) {
-      const el = $(sel);
-      if (el.length && el.text().trim().length > 200) {
-        return el.html() || '';
+      try {
+        const r = await fetchApi(cdnUrl);
+        const text = await r.text();
+
+        // Réponse JSON
+        try {
+          const json = JSON.parse(text);
+          const content = json.content ?? json.text ?? json.body ?? json.html ?? '';
+          if (typeof content === 'string' && content.length > 100) {
+            return content.replace(/\\n/g, '\n').replace(/\\"/g, '"');
+          }
+        } catch {}
+
+        // Réponse HTML / texte brut
+        if (text.length > 100) {
+          // Si c'est du HTML, on le retourne directement
+          if (text.trimStart().startsWith('<')) {
+            return text;
+          }
+          // Sinon on enveloppe le texte brut dans des paragraphes
+          return text
+            .split('\n')
+            .filter(l => l.trim())
+            .map(l => `<p>${l.trim()}</p>`)
+            .join('\n');
+        }
+      } catch {}
+    }
+
+    // Fallback : parser la page web
+    try {
+      const r = await fetchApi(this.site + chapterPath);
+      const html = await r.text();
+      const $ = load(html);
+
+      const selectors = [
+        '.chapter-content',
+        '[class*="chapterContent"]',
+        '[class*="chapter-text"]',
+        '.prose',
+        'article',
+      ];
+
+      for (const sel of selectors) {
+        const el = $(sel);
+        if (el.length && el.text().trim().length > 200) {
+          return el.html() || '';
+        }
       }
-    }
 
-    // Fallback données RSC
-    const raw = extractNextFlightData(html);
-    const m = raw.match(/"(?:content|text|body)":"([\s\S]{200,}?)(?<!\\)"/);
-    if (m) {
-      return m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-    }
+      // Fallback données RSC
+      const raw = extractNextFlightData(html);
+      const m = raw.match(/"(?:content|text|body)":"([\s\S]{200,}?)(?<!\\)"/);
+      if (m) {
+        return m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+      }
+    } catch {}
 
     return '<p><em>Le contenu de ce chapitre est chargé dynamiquement. Veuillez l\'ouvrir dans le navigateur intégré.</em></p>';
   }
