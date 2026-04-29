@@ -6,7 +6,7 @@ import { Filters } from '@libs/filterInputs';
 /**
  * Plugin LNReader — NovelFrance
  * Site    : https://novelfrance.fr
- * Version : 3.3.0
+ * Version : 3.7.0
  *
  * Fix v3.3 :
  *  - API /api/chapters limite à 100 par page (confirmé)
