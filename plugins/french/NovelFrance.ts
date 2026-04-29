@@ -6,12 +6,12 @@ import { Filters } from '@libs/filterInputs';
 /**
  * Plugin LNReader — NovelFrance
  * Site    : https://novelfrance.fr
- * Version : 3.7.0
+ * Version : 1.0.0 — 100% API REST, zero scraping HTML
  *
- * Fix v3.3 :
- *  - API /api/chapters limite à 100 par page (confirmé)
- *  - Pagination par batch de 100 avec retry + délai
- *  - Shadow Slave = 30 requêtes, roman de 50ch = 1 requête
+ * Optimisations :
+ *  - _count.chapters transmis a fetchChaptersApi (evite 1 requete)
+ *  - TAKE=100 confirme, Shadow Slave = 30 requetes
+ *  - retry exponentiel sur toutes les requetes
  */
 
 const BASE = 'https://novelfrance.fr';
@@ -82,7 +82,7 @@ class NovelFrancePlugin implements Plugin.PluginBase {
   name = 'NovelFrance';
   icon = 'src/fr/novelfrance/icon.png';
   site = BASE;
-  version = '3.3.0';
+  version = '1.0.0';
   filters = {} satisfies Filters;
 
   async popularNovels(
@@ -154,7 +154,8 @@ class NovelFrancePlugin implements Plugin.PluginBase {
         .filter(Boolean).join(',');
     }
 
-    novel.chapters = await this.fetchChaptersApi(slug);
+    const chapterTotal: number = data._count?.chapters ?? 0;
+    novel.chapters = await this.fetchChaptersApi(slug, chapterTotal);
     return novel;
   }
 
@@ -192,19 +193,21 @@ class NovelFrancePlugin implements Plugin.PluginBase {
   //           Roman de 50 ch        = 1 requête
   // -------------------------------------------------------------------------
 
-  private async fetchChaptersApi(slug: string): Promise<Plugin.ChapterItem[]> {
-    // Récupérer le total d'abord
-    let total = 0;
-    try {
-      const probe = await fetchWithRetry(
-        BASE + '/api/chapters/' + slug + '?skip=0&take=1&order=asc',
-        { headers: API_HEADERS },
-      );
-      if (probe.ok) {
-        const j = await probe.json() as any;
-        if (typeof j.total === 'number') total = j.total;
-      }
-    } catch (_) {}
+  private async fetchChaptersApi(slug: string, knownTotal = 0): Promise<Plugin.ChapterItem[]> {
+    // Utiliser le total connu depuis parseNovel si disponible (evite 1 requete)
+    let total = knownTotal;
+    if (total === 0) {
+      try {
+        const probe = await fetchWithRetry(
+          BASE + '/api/chapters/' + slug + '?skip=0&take=1&order=asc',
+          { headers: API_HEADERS },
+        );
+        if (probe.ok) {
+          const j = await probe.json() as any;
+          if (typeof j.total === 'number') total = j.total;
+        }
+      } catch (_) {}
+    }
 
     if (total === 0) return [];
 
