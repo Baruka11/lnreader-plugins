@@ -6,13 +6,16 @@ import { Filters } from '@libs/filterInputs';
 /**
  * Plugin LNReader — NovelFrance
  * Site    : https://novelfrance.fr
- * Version : 4.1.0
+ * Version : 3.3.0
  *
- * Fix v3.1 : searchNovels retourne [] pour pageNo > 1 (pas de pagination
- * sur /search), évitant le crash "Network request failed" au scroll.
+ * Fix v3.3 :
+ *  - API /api/chapters limite à 100 par page (confirmé)
+ *  - Pagination par batch de 100 avec retry + délai
+ *  - Shadow Slave = 30 requêtes, roman de 50ch = 1 requête
  */
 
 const BASE = 'https://novelfrance.fr';
+const TAKE = 100; // Limite serveur confirmée
 
 const NAV_HEADERS = {
   'User-Agent':
@@ -30,6 +33,31 @@ const API_HEADERS = {
   'Accept-Language': 'fr-FR,fr;q=0.9',
   'Referer': BASE + '/',
 };
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  retries = 3,
+  baseDelay = 1000,
+): Promise<Response> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const r = await fetchApi(url, options);
+      if (r.ok) return r;
+      if ((r.status === 429 || r.status >= 500) && i < retries) {
+        await sleep(baseDelay * Math.pow(2, i));
+        continue;
+      }
+      return r;
+    } catch (e) {
+      if (i < retries) await sleep(baseDelay * Math.pow(2, i));
+      else throw e;
+    }
+  }
+  throw new Error('Max retries: ' + url);
+}
 
 // ---------------------------------------------------------------------------
 // Extraction RSC
@@ -109,103 +137,57 @@ class NovelFrancePlugin implements Plugin.PluginBase {
   name = 'NovelFrance';
   icon = 'src/fr/novelfrance/icon.png';
   site = BASE;
-  version = '3.1.0';
+  version = '3.3.0';
   filters = {} satisfies Filters;
-
-  // -------------------------------------------------------------------------
-  // popularNovels
-  // -------------------------------------------------------------------------
 
   async popularNovels(
     pageNo: number,
     { showLatestNovels }: Plugin.PopularNovelsOptions<typeof this.filters>,
   ): Promise<Plugin.NovelItem[]> {
-    const url = showLatestNovels
-      ? BASE + '/latest?page=' + pageNo
-      : pageNo === 1 ? BASE + '/' : BASE + '/browse?sort=popular&page=' + pageNo;
+    // API REST native — total: 408 romans, totalPages: 21, 20 par page
+    const sort = showLatestNovels ? 'latest' : 'popular';
+    const url = BASE + '/api/novels?page=' + pageNo + '&take=20&sort=' + sort;
 
-    const r = await fetchApi(url, { headers: NAV_HEADERS });
+    const r = await fetchWithRetry(url, { headers: API_HEADERS });
     if (!r.ok) return [];
-    const rsc = extractRSC(await r.text());
 
-    const data = extractObject(rsc, 'initialData');
-    if (data) {
-      const list: any[] = showLatestNovels
-        ? (data.recentlyAdded || [])
-        : (data.popular || []);
-      if (list.length > 0) {
-        return list.map(it => ({
-          name: it.title || '',
-          cover: cover(it.coverImage),
-          path: '/novel/' + it.slug,
-        }));
-      }
-    }
-    return parseNovelsFromRSC(rsc);
+    const json = await r.json() as any;
+    const novels: any[] = json.novels || json.data || [];
+
+    return novels.map(it => ({
+      name: it.title || '',
+      cover: cover(it.coverImage),
+      path: '/novel/' + it.slug,
+    }));
   }
-
-  // -------------------------------------------------------------------------
-  // searchNovels
-  //
-  // IMPORTANT : le site n'a pas de pagination de recherche côté SSR.
-  // On retourne [] pour pageNo > 1 pour éviter le crash au scroll.
-  // -------------------------------------------------------------------------
 
   async searchNovels(
     searchTerm: string,
     pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
-    // Pas de pagination — une seule page de résultats
-    if (pageNo > 1) return [];
+    // API REST native avec pagination — totalPages: 21
+    const url =
+      BASE + '/api/novels?search=' + encodeURIComponent(searchTerm) +
+      '&page=' + pageNo + '&take=20';
 
-    const term = searchTerm.toLowerCase().normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
+    const r = await fetchWithRetry(url, { headers: API_HEADERS });
+    if (!r.ok) return [];
 
-    // Essai 1 : /search?q=
-    try {
-      const r = await fetchApi(
-        BASE + '/search?q=' + encodeURIComponent(searchTerm),
-        { headers: NAV_HEADERS },
-      );
-      if (r.ok) {
-        const rsc = extractRSC(await r.text());
-        const novels = parseNovelsFromRSC(rsc);
-        if (novels.length > 0) {
-          return novels.filter(n =>
-            n.name.toLowerCase().normalize('NFD')
-              .replace(/[\u0300-\u036f]/g, '').includes(term),
-          );
-        }
-      }
-    } catch (_) {}
+    const json = await r.json() as any;
+    const novels: any[] = json.novels || json.data || [];
 
-    // Essai 2 : /browse?q=
-    try {
-      const r = await fetchApi(
-        BASE + '/browse?q=' + encodeURIComponent(searchTerm),
-        { headers: NAV_HEADERS },
-      );
-      if (r.ok) {
-        const rsc = extractRSC(await r.text());
-        return parseNovelsFromRSC(rsc).filter(n =>
-          n.name.toLowerCase().normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '').includes(term),
-        );
-      }
-    } catch (_) {}
-
-    return [];
+    return novels.map(it => ({
+      name: it.title || '',
+      cover: cover(it.coverImage),
+      path: '/novel/' + it.slug,
+    }));
   }
-
-  // -------------------------------------------------------------------------
-  // parseNovel
-  // -------------------------------------------------------------------------
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const slug = slugFrom(novelPath);
     const url  = novelUrl(novelPath);
 
-    const r = await fetchApi(url, { headers: NAV_HEADERS });
+    const r = await fetchWithRetry(url, { headers: NAV_HEADERS });
     if (!r.ok) throw new Error('Échec chargement : ' + url);
     const html = await r.text();
     const rsc  = extractRSC(html);
@@ -239,28 +221,26 @@ class NovelFrancePlugin implements Plugin.PluginBase {
     return novel;
   }
 
-  // -------------------------------------------------------------------------
-  // parseChapter
-  // -------------------------------------------------------------------------
-
   async parseChapter(chapterPath: string): Promise<string> {
-    const r = await fetchApi(BASE + '/novel' + chapterPath, {
-      headers: NAV_HEADERS,
-    });
-    if (!r.ok) throw new Error('Échec chargement chapitre');
+    const r = await fetchWithRetry(
+      BASE + '/novel' + chapterPath,
+      { headers: NAV_HEADERS },
+      3,
+      1500,
+    );
+    if (!r.ok) throw new Error('Échec chapitre (status ' + r.status + ')');
+
     const html = await r.text();
     const rsc  = extractRSC(html);
 
-    // Stratégie 1 : initialChapter.paragraphs[].content
     const ch = extractObject(rsc, 'initialChapter');
     if (ch && Array.isArray(ch.paragraphs) && ch.paragraphs.length > 0) {
-      const lines: string[] = ch.paragraphs
+      return '<p>' + ch.paragraphs
         .map((p: any) => (p.content || '').trim())
-        .filter((l: string) => l.length > 0);
-      return '<p>' + lines.join('</p><p>') + '</p>';
+        .filter((l: string) => l.length > 0)
+        .join('</p><p>') + '</p>';
     }
 
-    // Stratégie 2 : champs "content" bruts
     const contentRe = /"content":"((?:[^"\\]|\\.)*)"/g;
     const lines: string[] = [];
     let m: RegExpExecArray | null;
@@ -271,7 +251,6 @@ class NovelFrancePlugin implements Plugin.PluginBase {
     }
     if (lines.length > 0) return '<p>' + lines.join('</p><p>') + '</p>';
 
-    // Stratégie 3 : balises HTML
     const pRe = /<p[^>]*class="[^"]*select-text[^"]*"[^>]*>([\s\S]*?)<\/p>/g;
     const htmlLines: string[] = [];
     while ((m = pRe.exec(html)) !== null) {
@@ -281,21 +260,22 @@ class NovelFrancePlugin implements Plugin.PluginBase {
         .replace(/&gt;/g, '>').trim();
       if (t) htmlLines.push(t);
     }
-    return '<p>' + htmlLines.join('</p><p>') + '</p>';
+    if (htmlLines.length > 0) return '<p>' + htmlLines.join('</p><p>') + '</p>';
+
+    throw new Error('Contenu introuvable — réessayez');
   }
 
   // -------------------------------------------------------------------------
-  // fetchChaptersApi — API REST native /api/chapters/{slug}
-  //
-  // Charge tout en une passe avec un take élevé pour éviter les boucles
-  // de 60+ requêtes qui saturent la mémoire sur mobile.
+  // fetchChaptersApi — 100 chapitres par page, pagination complète
+  // Exemple : Shadow Slave (2967 ch) = 30 requêtes
+  //           Roman de 50 ch        = 1 requête
   // -------------------------------------------------------------------------
 
   private async fetchChaptersApi(slug: string): Promise<Plugin.ChapterItem[]> {
-    // Étape 1 : récupérer le total depuis la première page (take=1)
-    let total = 9999;
+    // Récupérer le total d'abord
+    let total = 0;
     try {
-      const probe = await fetchApi(
+      const probe = await fetchWithRetry(
         BASE + '/api/chapters/' + slug + '?skip=0&take=1&order=asc',
         { headers: API_HEADERS },
       );
@@ -305,43 +285,20 @@ class NovelFrancePlugin implements Plugin.PluginBase {
       }
     } catch (_) {}
 
-    // Étape 2 : tout charger en une seule requête
-    try {
-      const r = await fetchApi(
-        BASE + '/api/chapters/' + slug +
-          '?skip=0&take=' + total + '&order=asc',
-        { headers: API_HEADERS },
-      );
-      if (r.ok) {
-        const json = await r.json() as any;
-        const chapters: any[] = Array.isArray(json)
-          ? json
-          : (json.chapters || json.data || []);
+    if (total === 0) return [];
 
-        if (chapters.length > 0) {
-          return this.formatChapters(slug, chapters);
-        }
-      }
-    } catch (_) {}
-
-    // Fallback : pagination par batch de 50 avec délai
-    return this.fetchChaptersPaged(slug, total);
-  }
-
-  private async fetchChaptersPaged(
-    slug: string,
-    total: number,
-  ): Promise<Plugin.ChapterItem[]> {
-    const TAKE = 50;
+    const numPages = Math.ceil(total / TAKE);
     let all: any[] = [];
-    let skip = 0;
 
-    while (skip < total) {
+    for (let page = 0; page < numPages; page++) {
+      const skip = page * TAKE;
       try {
-        const r = await fetchApi(
+        const r = await fetchWithRetry(
           BASE + '/api/chapters/' + slug +
             '?skip=' + skip + '&take=' + TAKE + '&order=asc',
           { headers: API_HEADERS },
+          3,
+          1000,
         );
         if (!r.ok) break;
         const json = await r.json() as any;
@@ -349,9 +306,10 @@ class NovelFrancePlugin implements Plugin.PluginBase {
           ? json : (json.chapters || json.data || []);
         if (batch.length === 0) break;
         all = all.concat(batch);
-        skip += TAKE;
-        // Petit délai pour ne pas saturer
-        await new Promise(res => setTimeout(res, 200));
+
+        // Délai entre les pages pour éviter le rate-limit
+        // ~300ms × 30 pages = ~9s pour Shadow Slave
+        if (page < numPages - 1) await sleep(300);
       } catch (_) {
         break;
       }
