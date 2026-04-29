@@ -6,7 +6,7 @@ import { Filters } from '@libs/filterInputs';
 /**
  * Plugin LNReader — NovelFrance
  * Site    : https://novelfrance.fr
- * Version : 3.1.0
+ * Version : 4.1.0
  *
  * Fix v3.1 : searchNovels retourne [] pour pageNo > 1 (pas de pagination
  * sur /search), évitant le crash "Network request failed" au scroll.
