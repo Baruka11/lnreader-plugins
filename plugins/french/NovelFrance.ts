@@ -1,21 +1,16 @@
 /**
- * Plugin LNreader — NovelFrance.fr v2.0.0
- * Moteur : Next.js custom (ex-MassNovel)
+ * Plugin LNreader — NovelFrance.fr v3.0.0
  *
- * Structure des URLs :
- *   Roman    → https://novelfrance.fr/novel/{slug}
- *   Chapitre → https://novelfrance.fr/novel/{slug}/{chapter-slug}
- *   Images   → https://novelfrance.fr/uploads/covers/{filename}
+ * IMPORTANT : LNreader fournit fetchApi() dans le contexte d'exécution des plugins.
+ * On utilise fetchApi au lieu de fetch() pour éviter le "Network request failed".
  *
- * Le site embarque toutes les données en RSC (React Server Components)
- * dans des blocs self.__next_f.push([1, "..."]) — on parse ces blocs JSON.
+ * Format conforme à : https://github.com/LNReader/lnreader-plugins
  */
 
 const plugin = {
-  /* ── Métadonnées ──────────────────────────────────────────────── */
   id: "novelfrance",
   name: "NovelFrance",
-  version: "2.0.0",
+  version: "3.0.0",
   icon: "https://novelfrance.fr/icons/icon-32x32.png",
   site: "https://novelfrance.fr",
   lang: "French",
@@ -23,238 +18,191 @@ const plugin = {
   requirePath: "",
   pluginType: "source",
 
-  /* ── Constantes ────────────────────────────────────────────────── */
+  /* ─────────── Constantes ─────────── */
   _base: "https://novelfrance.fr",
 
-  /* ── Helpers ───────────────────────────────────────────────────── */
-  _headers() {
-    return {
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-      "User-Agent":
-        "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/112 Mobile Safari/537.36",
-      Referer: "https://novelfrance.fr/",
-    };
-  },
+  /* ─────────── Helpers ─────────── */
 
-  async _fetchHTML(url) {
-    const res = await fetch(url, { headers: this._headers() });
-    if (!res.ok) throw new Error(`HTTP ${res.status} — ${url}`);
+  // LNreader injecte fetchApi dans le scope global
+  async _get(url) {
+    // fetchApi est l'API réseau injectée par LNreader (React Native fetch wrapper)
+    const fn = typeof fetchApi !== "undefined" ? fetchApi : fetch;
+    const res = await fn(url, {
+      method: "GET",
+      headers: {
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36",
+      },
+    });
     return res.text();
   },
 
-  /** Extrait tous les blocs JSON du payload RSC de Next.js */
-  _extractRSCPayload(html) {
-    // Le contenu JSON est dans : self.__next_f.push([1, "..."])
-    // Les guillemets sont échappés dans la string JS
-    const chunks = [];
-    const rx = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
+  /** Extrait le JSON embarqué dans le payload RSC de Next.js */
+  _rsc(html) {
+    let out = "";
+    const re = /self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)/g;
     let m;
-    while ((m = rx.exec(html)) !== null) {
-      try {
-        // Désescaper la string JS
-        const raw = m[1]
-          .replace(/\\n/g, "\n")
-          .replace(/\\r/g, "")
-          .replace(/\\t/g, "\t")
-          .replace(/\\"/g, '"')
-          .replace(/\\\\/g, "\\");
-        chunks.push(raw);
-      } catch (_) {}
+    while ((m = re.exec(html)) !== null) {
+      out += m[1]
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "")
+        .replace(/\\t/g, " ")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, "\\");
     }
-    return chunks.join("\n");
+    return out;
   },
 
-  _coverUrl(path) {
+  _cover(path) {
     if (!path) return "";
-    if (path.startsWith("http")) return path;
-    return this._base + path;
+    return path.startsWith("http") ? path : this._base + path;
   },
 
-  _mapStatus(raw) {
-    if (!raw) return "Unknown";
-    switch (raw.toUpperCase()) {
-      case "ONGOING":   return "Ongoing";
-      case "COMPLETED": return "Completed";
-      case "DROPPED":
-      case "CANCELED":  return "Dropped";
-      default:          return "Unknown";
-    }
+  _status(s) {
+    if (!s) return "Unknown";
+    if (s === "ONGOING")   return "Ongoing";
+    if (s === "COMPLETED") return "Completed";
+    if (s === "DROPPED" || s === "CANCELED") return "Dropped";
+    return "Unknown";
   },
 
-  _decodeText(s) {
-    return s
+  _unescape(s) {
+    return (s || "")
       .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t")
+      .replace(/\\t/g, " ")
       .replace(/\\"/g, '"')
       .replace(/\\\\/g, "\\")
       .replace(/\\r/g, "");
   },
 
-  /* ── 1. ROMANS POPULAIRES ──────────────────────────────────────── */
-  async popularNovels(page, { showLatestNovels } = {}) {
-    const sort = showLatestNovels ? "newest" : "popular";
-    const html = await this._fetchHTML(`${this._base}/browse?sort=${sort}&page=${page}`);
-    const novels = this._parseNovelCards(html);
-    return { novels, hasNextPage: novels.length >= 18 };
-  },
-
-  /* ── 2. RECHERCHE ──────────────────────────────────────────────── */
-  async searchNovels(query, page) {
-    const url = `${this._base}/search?q=${encodeURIComponent(query)}&page=${page}`;
-    const html = await this._fetchHTML(url);
-    const novels = this._parseNovelCards(html);
-    return { novels, hasNextPage: novels.length >= 18 };
-  },
-
-  /**
-   * Parse les cartes de romans depuis une page HTML.
-   * Les données sont dans les blocs RSC sous forme :
-   * "slug":"shadow-slave","coverImage":"/uploads/covers/xxx.webp","title":"Shadow Slave"
-   */
-  _parseNovelCards(html) {
-    const payload = this._extractRSCPayload(html);
+  /** Parse les cartes de romans depuis le payload RSC */
+  _cards(payload) {
     const novels = [];
-    const seen = new Set();
-
-    // Pattern : "slug":"xxx","description":"...","coverImage":"...","author":"..."
-    const rx = /"title":"([^"]+)","slug":"([^"\/]+)","description":"(?:[^"\\]|\\.)*","coverImage":"([^"]+)"/g;
+    const seen   = new Set();
+    // Motif : "title":"...","slug":"...","description":"...","coverImage":"..."
+    const re = /"title":"([^"]+)","slug":"([\w-]+)"[^}]{0,200}?"coverImage":"(\/uploads\/[^"]+)"/g;
     let m;
-    while ((m = rx.exec(payload)) !== null) {
+    while ((m = re.exec(payload)) !== null) {
       const slug = m[2];
       if (seen.has(slug)) continue;
       seen.add(slug);
       novels.push({
-        name: m[1],
-        path: `/novel/${slug}`,
-        cover: this._coverUrl(m[3]),
+        name:  m[1],
+        path:  `/novel/${slug}`,
+        cover: this._cover(m[3]),
       });
     }
-
-    // Fallback : chercher les liens /novel/ dans le HTML brut
-    if (novels.length === 0) {
-      const linkRx = /href="\/novel\/([^"\/]+)"/g;
-      const imgRx = /\/uploads\/covers\/[^"]+\.(?:webp|jpg|jpeg|png)/g;
-      const slugs = [...new Set([...html.matchAll(linkRx)].map((x) => x[1]))];
-      const imgs = [...html.matchAll(imgRx)].map((x) => x[0]);
-      slugs.forEach((slug, i) => {
-        novels.push({
-          name: slug.replace(/-/g, " "),
-          path: `/novel/${slug}`,
-          cover: imgs[i] ? this._coverUrl(imgs[i]) : "",
-        });
-      });
-    }
-
     return novels;
   },
 
-  /* ── 3. DÉTAIL D'UN ROMAN ──────────────────────────────────────── */
+  /* ─────────── 1. Populaires ─────────── */
+  async popularNovels(page, { showLatestNovels } = {}) {
+    const sort = showLatestNovels ? "newest" : "popular";
+    const html  = await this._get(`${this._base}/browse?sort=${sort}&page=${page}`);
+    const novels = this._cards(this._rsc(html));
+    return { novels, hasNextPage: novels.length >= 18 };
+  },
+
+  /* ─────────── 2. Recherche ─────────── */
+  async searchNovels(query, page) {
+    const html   = await this._get(`${this._base}/search?q=${encodeURIComponent(query)}&page=${page}`);
+    const novels = this._cards(this._rsc(html));
+    return { novels, hasNextPage: novels.length >= 18 };
+  },
+
+  /* ─────────── 3. Détail roman ─────────── */
   async parseNovelAndChapters(novelPath) {
-    const slug = novelPath.replace(/^\/novel\//, "");
-    const html = await this._fetchHTML(`${this._base}/novel/${slug}`);
-    const payload = this._extractRSCPayload(html);
+    const slug    = novelPath.replace(/^\/novel\//, "");
+    const html    = await this._get(`${this._base}/novel/${slug}`);
+    const payload = this._rsc(html);
 
-    /* ---- Infos du roman ---- */
-    let name = slug.replace(/-/g, " ");
-    let cover = "";
+    /* --- Métadonnées --- */
+    let name    = slug.replace(/-/g, " ");
+    let cover   = "";
     let summary = "";
-    let author = "";
-    let status = "Unknown";
-    let genres = [];
+    let author  = "";
+    let status  = "Unknown";
+    const genres = [];
 
-    // Bloc complet du roman — on cherche le premier objet contenant le slug courant
-    const novelRx = new RegExp(
-      `"title":"([^"]+)","slug":"${slug.replace(/[-]/g, "\\-")}"[^}]*?"description":"((?:[^"\\\\]|\\\\.)*)"[^}]*?"coverImage":"([^"]+)"[^}]*?"author":"([^"]+)"[^}]*?"status":"([^"]+)"`
+    // Chercher le bloc complet pour ce slug
+    const slugEsc = slug.replace(/-/g, "\\-");
+    const full = payload.match(
+      new RegExp(
+        `"title":"([^"]+)","slug":"${slugEsc}"[\\s\\S]{0,400}?` +
+        `"description":"((?:[^"\\\\]|\\\\.)*)"[\\s\\S]{0,200}?` +
+        `"coverImage":"([^"]+)"[\\s\\S]{0,100}?` +
+        `"author":"([^"]+)"[\\s\\S]{0,100}?` +
+        `"status":"([A-Z]+)"`
+      )
     );
-    const nm = payload.match(novelRx);
-    if (nm) {
-      name    = nm[1];
-      summary = this._decodeText(nm[2]);
-      cover   = this._coverUrl(nm[3]);
-      author  = nm[4];
-      status  = this._mapStatus(nm[5]);
+
+    if (full) {
+      name    = full[1];
+      summary = this._unescape(full[2]);
+      cover   = this._cover(full[3]);
+      author  = full[4];
+      status  = this._status(full[5]);
     } else {
       // Fallbacks individuels
-      const t = payload.match(/"title":"([^"]+)"/);
-      if (t) name = t[1];
-      const d = payload.match(/"description":"((?:[^"\\]|\\.)*)"/);
-      if (d) summary = this._decodeText(d[1]);
-      const c = payload.match(/"coverImage":"(\/uploads\/covers\/[^"]+)"/);
-      if (c) cover = this._coverUrl(c[1]);
-      const a = payload.match(/"author":"([^"]+)"/);
-      if (a) author = a[1];
-      const s = payload.match(/"status":"([A-Z]+)"/);
-      if (s) status = this._mapStatus(s[1]);
+      const t = payload.match(/"title":"([^"]+)"/);         if (t) name   = t[1];
+      const d = payload.match(/"description":"((?:[^"\\]|\\.)*)"/); if (d) summary = this._unescape(d[1]);
+      const c = payload.match(/"coverImage":"(\/uploads\/[^"]+)"/); if (c) cover   = this._cover(c[1]);
+      const a = payload.match(/"author":"([^"]+)"/);         if (a) author = a[1];
+      const s = payload.match(/"status":"([A-Z]+)"/);        if (s) status = this._status(s[1]);
     }
 
     // Genres
-    const genreRx = /"genres":\[([^\]]+)\]/;
-    const gm = payload.match(genreRx);
-    if (gm) {
-      const nameRx = /"name":"([^"]+)"/g;
-      let gn;
-      while ((gn = nameRx.exec(gm[1])) !== null) {
-        genres.push(gn[1]);
-      }
+    const gblock = payload.match(/"genres":\[([^\]]{0,2000})\]/);
+    if (gblock) {
+      const gre = /"name":"([^"]{1,40})"/g;
+      let gm;
+      while ((gm = gre.exec(gblock[1])) !== null) genres.push(gm[1]);
     }
 
-    /* ---- Chapitres ---- */
-    const chapters = this._parseChapterList(payload, slug);
+    /* --- Chapitres --- */
+    const chapters = [];
+    const seen     = new Set();
+    const chRe     = /"chapterNumber":(\d+),"title":"([^"]*)","slug":"([\w-]+)","createdAt":"([^"]+)"/g;
+    let cm;
+    while ((cm = chRe.exec(payload)) !== null) {
+      const num = parseInt(cm[1]);
+      if (seen.has(num)) continue;
+      seen.add(num);
+      chapters.push({
+        name:          cm[2] || `Chapitre ${num}`,
+        path:          `/novel/${slug}/${cm[3]}`,
+        releaseTime:   cm[4] ? new Date(cm[4]).toLocaleDateString("fr-FR") : null,
+        chapterNumber: num,
+      });
+    }
+    chapters.sort((a, b) => a.chapterNumber - b.chapterNumber);
 
     return { name, cover, summary, author, status, genres, chapters };
   },
 
-  _parseChapterList(payload, slug) {
-    const chapters = [];
-    const seen = new Set();
-
-    // Pattern : "chapterNumber":1,"title":"Chapitre 1","slug":"chapter-1","createdAt":"2026-..."
-    const rx = /"chapterNumber":(\d+),"title":"([^"]+)","slug":"([^"]+)","createdAt":"([^"]+)"/g;
-    let m;
-    while ((m = rx.exec(payload)) !== null) {
-      const num = parseInt(m[1]);
-      if (seen.has(num)) continue;
-      seen.add(num);
-      chapters.push({
-        name: m[2] || `Chapitre ${num}`,
-        path: `/novel/${slug}/${m[3]}`,
-        releaseTime: m[4] ? new Date(m[4]).toLocaleDateString("fr-FR") : null,
-        chapterNumber: num,
-      });
-    }
-
-    // Trier du plus ancien au plus récent
-    return chapters.sort((a, b) => a.chapterNumber - b.chapterNumber);
-  },
-
-  /* ── 4. CONTENU D'UN CHAPITRE ──────────────────────────────────── */
+  /* ─────────── 4. Contenu chapitre ─────────── */
   async parseChapter(chapterPath) {
-    // chapterPath = "/novel/shadow-slave/chapter-42"
-    const html = await this._fetchHTML(this._base + chapterPath);
-    const payload = this._extractRSCPayload(html);
-
-    let text = "";
+    const html    = await this._get(this._base + chapterPath);
+    const payload = this._rsc(html);
+    let text      = "";
 
     // Le contenu est dans "contentMarkdown":"..." ou "content":"..."
-    const contentRx = /"content(?:Markdown)?":"((?:[^"\\]|\\.)*)"/;
-    const cm = payload.match(contentRx);
+    const cm = payload.match(/"content(?:Markdown)?":"((?:[^"\\]|\\.)*)"/);
     if (cm) {
-      text = this._decodeText(cm[1]).trim();
+      text = this._unescape(cm[1]).trim();
     }
 
-    // Si on n'a pas trouvé le contenu, chercher dans le HTML brut
-    if (!text || text.length < 100) {
-      // Enlever les balises et ne garder que le texte des paragraphes
-      const paraRx = /<p[^>]*>([\s\S]*?)<\/p>/gi;
-      const paras = [];
+    // Fallback : extraire les <p> du HTML rendu
+    if (text.length < 50) {
+      const paraRe = /<p[^>]*>([\s\S]*?)<\/p>/gi;
+      const paras  = [];
       let pm;
-      while ((pm = paraRx.exec(html)) !== null) {
+      while ((pm = paraRe.exec(html)) !== null) {
         const p = pm[1]
           .replace(/<[^>]+>/g, "")
-          .replace(/&lt;/g, "<")
-          .replace(/&gt;/g, ">")
-          .replace(/&amp;/g, "&")
+          .replace(/&amp;/g,  "&")
+          .replace(/&lt;/g,   "<")
+          .replace(/&gt;/g,   ">")
           .replace(/&nbsp;/g, " ")
           .replace(/&#x27;/g, "'")
           .replace(/&quot;/g, '"')
@@ -264,25 +212,20 @@ const plugin = {
       text = paras.join("\n\n");
     }
 
-    // Nettoyage final
-    text = text
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-
-    return { text: text || "Contenu non disponible." };
+    return { text: text.replace(/\n{3,}/g, "\n\n").trim() || "Contenu non disponible." };
   },
 
-  /* ── 5. FILTRES ────────────────────────────────────────────────── */
+  /* ─────────── 5. Filtres ─────────── */
   filters: [
     {
       key: "sort",
       label: "Trier par",
       values: [
-        { label: "Populaire",   value: "popular"  },
-        { label: "Tendance",    value: "trending" },
-        { label: "Mieux noté",  value: "rating"   },
-        { label: "Plus récent", value: "latest"   },
-        { label: "Nouveau",     value: "newest"   },
+        { label: "Populaire",    value: "popular"  },
+        { label: "Tendance",     value: "trending" },
+        { label: "Mieux noté",   value: "rating"   },
+        { label: "Plus récent",  value: "latest"   },
+        { label: "Nouveau",      value: "newest"   },
       ],
       inputType: "Picker",
     },
@@ -290,10 +233,10 @@ const plugin = {
       key: "status",
       label: "Statut",
       values: [
-        { label: "Tous",       value: ""          },
-        { label: "En cours",   value: "ONGOING"   },
-        { label: "Terminé",    value: "COMPLETED" },
-        { label: "Abandonné",  value: "DROPPED"   },
+        { label: "Tous",      value: ""          },
+        { label: "En cours",  value: "ONGOING"   },
+        { label: "Terminé",   value: "COMPLETED" },
+        { label: "Abandonné", value: "DROPPED"   },
       ],
       inputType: "Picker",
     },
@@ -312,31 +255,31 @@ const plugin = {
       key: "genre",
       label: "Genre",
       values: [
-        { label: "Action",        value: "action"         },
-        { label: "Aventure",      value: "aventure"       },
-        { label: "Romance",       value: "romance"        },
-        { label: "Fantaisie",     value: "fantaisie"      },
-        { label: "Système",       value: "syst-me"        },
-        { label: "Mystère",       value: "myst-re"        },
-        { label: "Horreur",       value: "horreur"        },
-        { label: "Comédie",       value: "com-die"        },
-        { label: "Isekai",        value: "isekai"         },
-        { label: "Mature",        value: "mature"         },
-        { label: "Psychologique", value: "psychologique"  },
-        { label: "Seinen",        value: "seinen"         },
-        { label: "Xianxia",       value: "xianxia"        },
-        { label: "Xuanhuan",      value: "xuanhuan"       },
-        { label: "Arts Martiaux", value: "arts-martiaux"  },
-        { label: "Réincarnation", value: "r-incarnation"  },
-        { label: "Drama",         value: "drama"          },
-        { label: "Surnaturel",    value: "surnaturel"     },
-        { label: "Sci-fi",        value: "sci-fi"         },
-        { label: "Tragédie",      value: "trag-die"       },
-        { label: "Anti-Héros",    value: "anti-h-ros"     },
-        { label: "Harem",         value: "harem"          },
-        { label: "School Life",   value: "school-life"    },
-        { label: "Slice of Life", value: "slice-of-life"  },
-        { label: "Game",          value: "game"           },
+        { label: "Action",        value: "action"        },
+        { label: "Aventure",      value: "aventure"      },
+        { label: "Romance",       value: "romance"       },
+        { label: "Fantaisie",     value: "fantaisie"     },
+        { label: "Système",       value: "syst-me"       },
+        { label: "Mystère",       value: "myst-re"       },
+        { label: "Horreur",       value: "horreur"       },
+        { label: "Comédie",       value: "com-die"       },
+        { label: "Isekai",        value: "isekai"        },
+        { label: "Mature",        value: "mature"        },
+        { label: "Psychologique", value: "psychologique" },
+        { label: "Seinen",        value: "seinen"        },
+        { label: "Xianxia",       value: "xianxia"       },
+        { label: "Xuanhuan",      value: "xuanhuan"      },
+        { label: "Arts Martiaux", value: "arts-martiaux" },
+        { label: "Réincarnation", value: "r-incarnation" },
+        { label: "Drama",         value: "drama"         },
+        { label: "Surnaturel",    value: "surnaturel"    },
+        { label: "Sci-fi",        value: "sci-fi"        },
+        { label: "Tragédie",      value: "trag-die"      },
+        { label: "Anti-Héros",    value: "anti-h-ros"    },
+        { label: "Harem",         value: "harem"         },
+        { label: "School Life",   value: "school-life"   },
+        { label: "Slice of Life", value: "slice-of-life" },
+        { label: "Game",          value: "game"          },
       ],
       inputType: "Checkbox",
     },
@@ -344,15 +287,16 @@ const plugin = {
 
   async filterNovels(page, filters = {}) {
     const { sort = "popular", status = "", type = "", genre = [] } = filters;
-    const params = new URLSearchParams({ sort, page });
-    if (status) params.set("status", status);
-    if (type)   params.set("type", type);
-    genre.forEach((g) => params.append("genre", g));
+    const p = new URLSearchParams({ sort, page });
+    if (status) p.set("status", status);
+    if (type)   p.set("type",   type);
+    genre.forEach((g) => p.append("genre", g));
 
-    const html = await this._fetchHTML(`${this._base}/browse?${params.toString()}`);
-    const novels = this._parseNovelCards(html);
+    const html   = await this._get(`${this._base}/browse?${p.toString()}`);
+    const novels = this._cards(this._rsc(html));
     return { novels, hasNextPage: novels.length >= 18 };
   },
 };
 
+// Export standard LNreader
 export default plugin;
