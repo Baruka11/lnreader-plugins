@@ -1,372 +1,269 @@
 /**
  * Plugin LNReader — NovelFrance
- * Site : https://novelfrance.fr
- * Stratégie : scraping du SSR Next.js (__next_f payload)
+ * Site    : https://novelfrance.fr
+ * Version : 2.0.0
+ * Stratégie : scraping SSR Next.js (__next_f payload)
  *
- * Fonctions disponibles :
- *   popularNovels(page)
- *   searchNovels(searchTerm, page, filters)
- *   novelInfo(novelPath)
- *   chapterList(novelPath)
- *   readChapter(chapterPath)
+ * Structure de données confirmée :
+ *   - Page novel   : initialNovel + initialChaptersResponse
+ *   - Page chapitre: initialChapter.paragraphs[].content
+ *   - Pagination   : ?skip=N&take=50&order=desc
  */
 
 const BASE_URL = "https://novelfrance.fr";
 
 // ---------------------------------------------------------------------------
-// Utilitaire : extraire les données JSON injectées par Next.js dans le HTML
+// Extraction du payload RSC Next.js
 // ---------------------------------------------------------------------------
 
-/**
- * Reconstruit le payload RSC depuis les balises <script> __next_f.push(...)
- * et renvoie un objet JS parsé à partir des fragments JSON utiles.
- */
-function extractNextData(html) {
-  // Concatène tous les fragments RSC en une seule chaîne
+function extractRSC(html) {
   const fragments = [];
   const regex = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
-  let match;
-  while ((match = regex.exec(html)) !== null) {
+  let m;
+  while ((m = regex.exec(html)) !== null) {
     try {
-      // Les fragments sont encodés en JSON-string (échappements \\n, \\", etc.)
-      fragments.push(JSON.parse('"' + match[1] + '"'));
-    } catch (_) {
-      // ignore les fragments malformés
-    }
+      fragments.push(JSON.parse('"' + m[1] + '"'));
+    } catch (_) {}
   }
   return fragments.join("");
 }
 
 /**
- * Extrait la valeur d'un champ JSON embarqué dans le flux RSC.
- * Le flux RSC de Next.js contient des lignes du type :
- *   XX:T<hex>,<json>
- * ou des objets directement sérialisés.
- *
- * On cherche un objet JSON qui possède la clé `key`.
+ * Extrait un objet JSON depuis le RSC à partir de `"fieldName":{`.
+ * Gère les accolades imbriquées.
  */
-function parseRSCObject(rscText, key) {
-  // Cherche un objet JSON contenant la clé demandée
-  // Les données utiles sont souvent précédées d'un identifiant hexadécimal + ":"
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(
-    '\\{[^{}]*"' + escaped + '"\\s*:[\\s\\S]*?\\}(?=\\s*[,\\]]|$)',
-    "g"
-  );
-
-  let best = null;
-  let m;
-  while ((m = pattern.exec(rscText)) !== null) {
-    try {
-      const obj = JSON.parse(m[0]);
-      if (obj[key] !== undefined) {
-        if (best === null || JSON.stringify(obj).length > JSON.stringify(best).length) {
-          best = obj;
-        }
-      }
-    } catch (_) {}
-  }
-  return best;
-}
-
-/**
- * Extrait directement un objet `initialData` ou `initialChapter`
- * présent dans le payload RSC sous la forme :
- *   "initialData":{...}
- * ou la ligne RSC :
- *   XX:{"initialData":{...}}
- */
-function extractJsonBlock(rscText, fieldName) {
-  // Cherche le champ et récupère le JSON complet (gestion des accolades imbriquées)
-  const start = rscText.indexOf('"' + fieldName + '":{');
+function extractObject(rsc, fieldName) {
+  const key = '"' + fieldName + '":{';
+  const start = rsc.indexOf(key);
   if (start === -1) return null;
 
-  const bodyStart = start + fieldName.length + 3; // position après `"fieldName":{`
+  let i = start + key.length;
   let depth = 1;
-  let i = bodyStart;
-  while (i < rscText.length && depth > 0) {
-    if (rscText[i] === "{") depth++;
-    else if (rscText[i] === "}") depth--;
+  while (i < rsc.length && depth > 0) {
+    if (rsc[i] === "{") depth++;
+    else if (rsc[i] === "}") depth--;
     i++;
   }
-
   try {
-    return JSON.parse("{" + rscText.slice(bodyStart, i));
+    return JSON.parse("{" + rsc.slice(start + key.length, i));
   } catch (_) {
     return null;
   }
 }
 
 /**
- * Extrait un tableau JSON depuis un champ RSC du type :
- *   "fieldName":[...]
+ * Extrait un tableau JSON depuis le RSC à partir de `"fieldName":[`.
  */
-function extractJsonArray(rscText, fieldName) {
-  const start = rscText.indexOf('"' + fieldName + '":[');
+function extractArray(rsc, fieldName) {
+  const key = '"' + fieldName + '":[';
+  const start = rsc.indexOf(key);
   if (start === -1) return null;
 
-  const bodyStart = start + fieldName.length + 3;
+  let i = start + key.length;
   let depth = 1;
-  let i = bodyStart;
-  while (i < rscText.length && depth > 0) {
-    if (rscText[i] === "[") depth++;
-    else if (rscText[i] === "]") depth--;
+  while (i < rsc.length && depth > 0) {
+    if (rsc[i] === "[") depth++;
+    else if (rsc[i] === "]") depth--;
     i++;
   }
-
   try {
-    return JSON.parse("[" + rscText.slice(bodyStart, i));
+    return JSON.parse("[" + rsc.slice(start + key.length, i));
   } catch (_) {
     return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers de mapping
+// Helpers
 // ---------------------------------------------------------------------------
 
-function buildCoverUrl(path) {
+function coverUrl(path) {
   if (!path) return "";
   if (path.startsWith("http")) return path;
   return BASE_URL + path;
 }
 
-function mapStatus(status) {
-  if (!status) return "Unknown";
-  const s = status.toUpperCase();
-  if (s === "ONGOING") return "Ongoing";
-  if (s === "COMPLETED") return "Completed";
+function mapStatus(s) {
+  if (!s) return "Unknown";
+  const u = s.toUpperCase();
+  if (u === "ONGOING") return "Ongoing";
+  if (u === "COMPLETED") return "Completed";
   return "Unknown";
 }
 
 function mapNovelCard(item) {
   return {
-    name: item.title || "Sans titre",
-    cover: buildCoverUrl(item.coverImage),
+    name: item.title || "",
+    cover: coverUrl(item.coverImage),
     path: "/novel/" + item.slug,
   };
 }
 
 // ---------------------------------------------------------------------------
-// popularNovels — page d'accueil, section "Incontournables" (populaires)
+// popularNovels — section "popular" de la page d'accueil
 // ---------------------------------------------------------------------------
 
 const popularNovels = async (page) => {
-  // La page d'accueil contient toutes les données en SSR
-  // On utilise /browse?sort=popular&page=N pour la pagination
-  const url =
-    page === 1
-      ? BASE_URL + "/"
-      : BASE_URL + "/browse?sort=popular&page=" + page;
+  const url = page === 1
+    ? BASE_URL + "/"
+    : BASE_URL + "/browse?sort=popular&page=" + page;
 
-  const result = await fetch(url);
-  const html = await result.text();
-  const rsc = extractNextData(html);
+  const res = await fetch(url);
+  const html = await res.text();
+  const rsc = extractRSC(html);
 
-  // Tenter de récupérer la section "popular" depuis initialData
-  const initialData = extractJsonBlock(rsc, "initialData");
+  const initialData = extractObject(rsc, "initialData");
+  if (initialData && Array.isArray(initialData.popular) && page === 1) {
+    return {
+      novels: initialData.popular.map(mapNovelCard),
+      hasNextPage: true,
+    };
+  }
 
-  let novels = [];
-
-  if (initialData && initialData.popular && page === 1) {
-    novels = initialData.popular.map(mapNovelCard);
-  } else {
-    // Fallback : page /browse — chercher les cards dans le HTML
-    // Chercher les slugs et titres dans le RSC brut
-    const slugPattern = /"slug":"([^"]+)","description"/g;
-    const titlePattern = /"title":"([^"]+)","slug"/g;
-    const coverPattern = /"coverImage":"([^"]+)"/g;
-
-    const slugs = [];
-    const titles = [];
-    const covers = [];
-
-    let m;
-    while ((m = slugPattern.exec(rsc)) !== null) slugs.push(m[1]);
-    while ((m = titlePattern.exec(rsc)) !== null) titles.push(m[1]);
-    while ((m = coverPattern.exec(rsc)) !== null) covers.push(m[1]);
-
-    const count = Math.min(slugs.length, titles.length);
-    for (let i = 0; i < count; i++) {
-      novels.push({
-        name: titles[i],
-        cover: buildCoverUrl(covers[i] || ""),
-        path: "/novel/" + slugs[i],
-      });
+  // Fallback : regex générique sur le RSC
+  const novels = [];
+  const slugSet = new Set();
+  const pattern = /"title":"([^"]+)","slug":"([^"]+)","description":"[^"]*","coverImage":"([^"]+)"/g;
+  let m;
+  while ((m = pattern.exec(rsc)) !== null) {
+    const slug = m[2];
+    if (!slugSet.has(slug)) {
+      slugSet.add(slug);
+      novels.push({ name: m[1], cover: coverUrl(m[3]), path: "/novel/" + slug });
     }
   }
 
-  return {
-    novels,
-    hasNextPage: novels.length >= 20,
-  };
+  return { novels, hasNextPage: novels.length >= 20 };
 };
 
 // ---------------------------------------------------------------------------
-// searchNovels — utilise /search?q=...
+// searchNovels — /search?q=...
 // ---------------------------------------------------------------------------
 
 const searchNovels = async (searchTerm, page, filters) => {
-  const url =
-    BASE_URL + "/search?q=" + encodeURIComponent(searchTerm) +
+  const url = BASE_URL + "/search?q=" + encodeURIComponent(searchTerm) +
     (page > 1 ? "&page=" + page : "");
 
-  const result = await fetch(url);
-  const html = await result.text();
-  const rsc = extractNextData(html);
+  const res = await fetch(url);
+  const html = await res.text();
+  const rsc = extractRSC(html);
 
-  // Les résultats de recherche sont dans un tableau "novels" ou "results"
-  const novelsArray = extractJsonArray(rsc, "novels") ||
-                      extractJsonArray(rsc, "results") ||
-                      [];
+  let items = extractArray(rsc, "novels") || extractArray(rsc, "results") || [];
+  const novels = items.map(mapNovelCard);
 
-  const novels = novelsArray.map(mapNovelCard);
-
-  // Fallback si aucun résultat structuré : extraire depuis le RSC brut
   if (novels.length === 0) {
-    const slugPattern = /"slug":"([^"]+)","description"/g;
-    const titlePattern = /"title":"([^"]+)","slug"/g;
-    const coverPattern = /"coverImage":"([^"]+)"/g;
-
-    const slugs = [];
-    const titles = [];
-    const covers = [];
-
+    const slugSet = new Set();
+    const pattern = /"title":"([^"]+)","slug":"([^"]+)","description":"[^"]*","coverImage":"([^"]+)"/g;
     let m;
-    while ((m = slugPattern.exec(rsc)) !== null) slugs.push(m[1]);
-    while ((m = titlePattern.exec(rsc)) !== null) titles.push(m[1]);
-    while ((m = coverPattern.exec(rsc)) !== null) covers.push(m[1]);
-
-    const count = Math.min(slugs.length, titles.length);
-    for (let i = 0; i < count; i++) {
-      novels.push({
-        name: titles[i],
-        cover: buildCoverUrl(covers[i] || ""),
-        path: "/novel/" + slugs[i],
-      });
+    while ((m = pattern.exec(rsc)) !== null) {
+      const slug = m[2];
+      if (!slugSet.has(slug)) {
+        slugSet.add(slug);
+        novels.push({ name: m[1], cover: coverUrl(m[3]), path: "/novel/" + slug });
+      }
     }
   }
 
-  return {
-    novels,
-    hasNextPage: novels.length >= 20,
-  };
+  return { novels, hasNextPage: novels.length >= 20 };
 };
 
 // ---------------------------------------------------------------------------
-// novelInfo — page du novel /novel/{slug}
+// novelInfo — /novel/{slug} → initialNovel
 // ---------------------------------------------------------------------------
 
 const novelInfo = async (novelPath) => {
-  const url = BASE_URL + novelPath;
-  const result = await fetch(url);
-  const html = await result.text();
-  const rsc = extractNextData(html);
+  const res = await fetch(BASE_URL + novelPath);
+  const html = await res.text();
+  const rsc = extractRSC(html);
 
-  // Chercher l'objet principal du novel dans le RSC
-  // Il contient : title, slug, author, description, coverImage, status, genres, _count.chapters
-  let info = {};
+  const novel = extractObject(rsc, "initialNovel");
 
-  // Tenter d'extraire depuis un bloc JSON structuré
-  const novelBlock = extractJsonBlock(rsc, "novel") ||
-                     extractJsonBlock(rsc, "initialData");
-
-  // Patterns de fallback directs dans le RSC
-  const getField = (field) => {
-    const m = new RegExp('"' + field + '":"([^"]*)"').exec(rsc);
-    return m ? m[1] : "";
-  };
-
-  const title = novelBlock?.title || getField("title");
-  const author = novelBlock?.author || getField("author");
-  const description = novelBlock?.description || getField("description");
-  const coverImage = novelBlock?.coverImage || getField("coverImage");
-  const status = novelBlock?.status || getField("status");
-
-  // Genres
-  let genres = [];
-  try {
-    const genreMatches = rsc.match(/"genres":\[([^\]]*)\]/);
-    if (genreMatches) {
-      const genreArr = JSON.parse("[" + genreMatches[1] + "]");
-      genres = genreArr.map((g) => g.name || g).filter(Boolean);
-    }
-  } catch (_) {
-    // Fallback : regex simple
-    const genrePattern = /"name":"([^"]+)","slug"/g;
-    let gm;
-    while ((gm = genrePattern.exec(rsc)) !== null) {
-      genres.push(gm[1]);
-    }
-    genres = [...new Set(genres)]; // dédoublonnage
+  if (!novel) {
+    // Fallback meta tags
+    const title = (/<title>([^<]+)<\/title>/.exec(html) || [])[1] || "";
+    const desc = (/<meta name="description" content="([^"]+)"/.exec(html) || [])[1] || "";
+    const cover = (/<meta property="og:image" content="([^"]+)"/.exec(html) || [])[1] || "";
+    return {
+      name: title.replace(/ - Lire.*$/, "").trim(),
+      cover,
+      summary: desc,
+      author: "",
+      artist: "",
+      status: "Unknown",
+      genres: [],
+      chapters: [],
+    };
   }
 
-  // Traducteur
-  const translatorName = novelBlock?.translatorName || getField("translatorName");
+  const genres = Array.isArray(novel.genres)
+    ? novel.genres.map((g) => (typeof g === "string" ? g : g.name)).filter(Boolean)
+    : [];
 
   return {
-    name: title,
-    cover: buildCoverUrl(coverImage),
-    summary: description,
-    author,
-    artist: translatorName ? "Traducteur : " + translatorName : "",
-    status: mapStatus(status),
+    name: novel.title || "",
+    cover: coverUrl(novel.coverImage),
+    summary: novel.description || "",
+    author: novel.author || "",
+    artist: novel.translatorName ? "Traducteur : " + novel.translatorName : "",
+    status: mapStatus(novel.status),
     genres,
-    // Le chargement des chapitres est fait par chapterList()
     chapters: [],
   };
 };
 
 // ---------------------------------------------------------------------------
-// chapterList — liste des chapitres depuis /novel/{slug}
-// Stratégie : la page novel contient parfois les chapitres en SSR,
-// sinon on tente l'endpoint paginé découvert via le network.
+// chapterList — /novel/{slug} avec pagination complète
+//
+// La page novel expose initialChaptersResponse :
+//   { chapters: [...50 items], total: N, take: 50, hasMore: bool }
+//
+// Pour obtenir tous les chapitres on pagine avec :
+//   /novel/{slug}?skip=N&take=50&order=desc
 // ---------------------------------------------------------------------------
 
 const chapterList = async (novelPath) => {
-  // Essai 1 : récupérer depuis la page novel directement
-  const url = BASE_URL + novelPath;
-  const result = await fetch(url);
-  const html = await result.text();
-  const rsc = extractNextData(html);
+  const slug = novelPath.replace(/^\/novel\//, "").replace(/\/$/, "");
 
-  // Chercher un tableau "chapters" dans le RSC
-  let chapters = [];
+  // Chargement initial
+  const res = await fetch(BASE_URL + novelPath);
+  const html = await res.text();
+  const rsc = extractRSC(html);
 
-  // Pattern pour les chapitres dans le RSC :
-  // {"id":"...","chapterNumber":N,"title":"...","slug":"chapter-N","createdAt":"..."}
-  const chapterPattern =
-    /\{"id":"[^"]+","chapterNumber":(\d+),"title":"([^"]+)","slug":"([^"]+)","createdAt":"([^"]+)"[^}]*\}/g;
+  const chaptersResp = extractObject(rsc, "initialChaptersResponse");
+  if (!chaptersResp || !Array.isArray(chaptersResp.chapters)) return [];
 
-  // Extraire le slug du novel depuis le path
-  const novelSlug = novelPath.replace("/novel/", "").replace(/\/$/, "");
+  const total = chaptersResp.total || 0;
+  const take = chaptersResp.take || 50;
+  let allChapters = [...chaptersResp.chapters];
 
-  let m;
-  while ((m = chapterPattern.exec(rsc)) !== null) {
-    chapters.push({
-      name: "Chapitre " + m[1] + " - " + m[2],
-      path: "/" + novelSlug + "/chapter-" + m[1],
-      releaseTime: m[4],
-      chapterNumber: parseInt(m[1]),
-    });
-  }
+  // Pagination si nécessaire
+  if (chaptersResp.hasMore && total > allChapters.length) {
+    const numPages = Math.ceil(total / take);
 
-  // Si aucun chapitre trouvé via pattern simple, chercher tableau "chapters"
-  if (chapters.length === 0) {
-    const chapterArray = extractJsonArray(rsc, "chapters");
-    if (chapterArray) {
-      chapters = chapterArray.map((c) => ({
-        name: "Chapitre " + c.chapterNumber + (c.title ? " - " + c.title : ""),
-        path: "/" + novelSlug + "/" + c.slug,
-        releaseTime: c.createdAt || c.publishedAt || "",
-        chapterNumber: c.chapterNumber,
-      }));
+    for (let page = 1; page < numPages; page++) {
+      const skip = page * take;
+      if (allChapters.length >= total) break;
+
+      try {
+        const pageRes = await fetch(
+          BASE_URL + "/novel/" + slug + "?skip=" + skip + "&take=" + take + "&order=desc"
+        );
+        const pageHtml = await pageRes.text();
+        const pageRsc = extractRSC(pageHtml);
+        const pageData = extractObject(pageRsc, "initialChaptersResponse");
+
+        if (pageData && Array.isArray(pageData.chapters)) {
+          allChapters = allChapters.concat(pageData.chapters);
+        }
+      } catch (_) {
+        break;
+      }
     }
   }
 
-  // Dédoublonner par chapterNumber et trier (ordre croissant par défaut)
+  // Dédoublonnage + tri ASC
   const seen = new Set();
-  chapters = chapters
+  const unique = allChapters
     .filter((c) => {
       if (seen.has(c.chapterNumber)) return false;
       seen.add(c.chapterNumber);
@@ -374,42 +271,35 @@ const chapterList = async (novelPath) => {
     })
     .sort((a, b) => a.chapterNumber - b.chapterNumber);
 
-  return chapters;
+  return unique.map((c) => ({
+    name: "Chapitre " + c.chapterNumber + (c.title ? " - " + c.title : ""),
+    path: "/" + slug + "/" + c.slug,
+    releaseTime: c.createdAt || "",
+    chapterNumber: c.chapterNumber,
+  }));
 };
 
 // ---------------------------------------------------------------------------
-// readChapter — contenu d'un chapitre
-// URL : /novel/{novelSlug}/{chapterSlug}
-// Les paragraphes sont dans initialChapter.paragraphs[].content
+// readChapter — /novel/{novelSlug}/{chapterSlug}
+// Données dans initialChapter.paragraphs[].content
 // ---------------------------------------------------------------------------
 
 const readChapter = async (chapterPath) => {
-  // chapterPath = "/{novelSlug}/{chapterSlug}" (sans /novel/ devant)
-  const url = BASE_URL + "/novel" + chapterPath;
-  const result = await fetch(url);
-  const html = await result.text();
-  const rsc = extractNextData(html);
+  // chapterPath = "/{novelSlug}/{chapterSlug}"
+  const res = await fetch(BASE_URL + "/novel" + chapterPath);
+  const html = await res.text();
+  const rsc = extractRSC(html);
 
-  // Chercher le bloc initialChapter dans le RSC
-  // Structure : "initialChapter":{..., "paragraphs":[{"content":"..."},...], ...}
-  const chapterBlock = extractJsonBlock(rsc, "initialChapter");
-
-  if (chapterBlock && chapterBlock.paragraphs) {
-    const paragraphs = chapterBlock.paragraphs;
-
-    // Construire le texte en assemblant les paragraphes
-    // On saute le premier (titre redondant) et l'éventuel crédit traducteur (index 1)
-    const textLines = paragraphs
-      .slice(0) // garder tout, y compris titre et crédits
+  // Stratégie 1 : initialChapter.paragraphs (structure confirmée)
+  const chapter = extractObject(rsc, "initialChapter");
+  if (chapter && Array.isArray(chapter.paragraphs) && chapter.paragraphs.length > 0) {
+    const lines = chapter.paragraphs
       .map((p) => (p.content || "").trim())
-      .filter((line) => line.length > 0);
-
-    const content = "<p>" + textLines.join("</p><p>") + "</p>";
-
-    return content;
+      .filter((l) => l.length > 0);
+    return "<p>" + lines.join("</p><p>") + "</p>";
   }
 
-  // Fallback : extraire les `content` depuis les paragraphes en RSC brut
+  // Stratégie 2 : champs "content" dans le RSC brut
   const contentPattern = /"content":"((?:[^"\\]|\\.)*)"/g;
   const lines = [];
   let m;
@@ -417,17 +307,13 @@ const readChapter = async (chapterPath) => {
     const line = m[1]
       .replace(/\\n/g, "\n")
       .replace(/\\"/g, '"')
-      .replace(/\\'/g, "'")
       .replace(/\\\\/g, "\\")
       .trim();
     if (line.length > 0) lines.push(line);
   }
+  if (lines.length > 0) return "<p>" + lines.join("</p><p>") + "</p>";
 
-  if (lines.length > 0) {
-    return "<p>" + lines.join("</p><p>") + "</p>";
-  }
-
-  // Dernier recours : scraping HTML classique des balises <p>
+  // Stratégie 3 : scraping HTML des balises <p class="...select-text...">
   const pPattern = /<p[^>]*class="[^"]*select-text[^"]*"[^>]*>([\s\S]*?)<\/p>/g;
   const htmlLines = [];
   while ((m = pPattern.exec(html)) !== null) {
@@ -438,15 +324,15 @@ const readChapter = async (chapterPath) => {
       .replace(/&amp;/g, "&")
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">")
+      .replace(/&#x2F;/g, "/")
       .trim();
     if (text) htmlLines.push(text);
   }
-
   return "<p>" + htmlLines.join("</p><p>") + "</p>";
 };
 
 // ---------------------------------------------------------------------------
-// Export du plugin
+// Export
 // ---------------------------------------------------------------------------
 
 module.exports = {
@@ -454,7 +340,7 @@ module.exports = {
   name: "NovelFrance",
   site: BASE_URL,
   lang: "fr",
-  version: "1.0.0",
+  version: "2.0.0",
 
   popularNovels,
   searchNovels,
